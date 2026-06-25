@@ -28,19 +28,21 @@ This document is the design discussion, not a finished spec. Open questions are 
 - **§2 External supervisor** — a *separate* agent watches intent; it cannot be a prompt to the
   executor (61.2% self-reflect vs 69.4% external; RLHF killed self-calibration).
 - **§3 Ask · act · preference** — preference *resolves*, ask/act *gates*; every answered ask becomes
-  a preference that lets it act next time. That loop is the learning.
+  a preference that lets it act next time. That loop is the learning. Escalation: your index → cohort
+  → frontier LLM → human.
 - **§4 Reversibility** — `git` makes undo ~free, so act-first/revert-wrong beats ask-on-everything;
   be *forceful only* when under-determined **and** irreversible. Correctness *is* convenience once
   you count cleanup.
 - **§5 Defensibility** — the moat is the *combination* A+B+C+D (external · ask/act+preference ·
-  passive behavior · transparent+measured); nobody has all four. Plus two structural moats:
-  git-as-label, per-user flywheel.
+  passive behavior · transparent+measured); nobody has all four. Plus three structural moats:
+  git-as-label, per-user flywheel, cross-user network effect.
 - **§6 Data layer** — log `resolution_event`s; `situation_signature` is make-or-break; *every user
   intervention (interrupt / correct / reject / revert) is a failure signal* — drive **preventable**
   to zero, make **irreducible** ("I'll know it when I see it") cheap (§4); `git revert` cleanest,
   not primary; never count never-viewed.
 - **§7 Cold start** — never *fully* cold (the repo **and its git history** are a prior); retrieval
-  not training → useful from the first event; mine commit history to pre-warm.
+  not training → useful from the first event; mine commit history to pre-warm; **configurable cohort
+  prior** (clean start / average / bought-expert).
 - **§8 Proof gate** — the one number that gates everything: *does a real human's override-rate
   fall?* Nobody has it. Prove it before the marketplace; it later becomes the trust certificate.
 - **§9 Path to a market** — prove on top coders → sell B2B (institutional memory) → consumer
@@ -159,13 +161,26 @@ agent intent under-determined (the monitor's trigger)
    │
  [1] situation resolves it?   (failing test, open file, diff, repo structure)   → act
    │ no
- [2] double resolves it WITH HIGH calibrated confidence?                         → act, LOG assumption visibly
+ [2] YOUR index resolves it WITH HIGH calibrated confidence?                     → act, LOG assumption visibly
    │   (this user's recent decisions, distilled prefs, how THIS repo does it)
    │ no / low confidence
+ [2b] cohort resolves it?  (cross-user prior — in-scope, abstracted, low trust)  → act, LOG ("borrowed")
+   │   no / low confidence                                          (configurable — §7)
+ [2c] frontier LLM reasons it out WITH HIGH confidence?                          → act, LOG
+   │   (escalate COMPUTE before the human — tokens are cheaper than attention)
+   │   no / still under-determined / IRREDUCIBLE
  [3] ASK the human  →  AND write the answer back into the index
         └─ the back-arrow is the whole game: every escalation is a training example;
            the threshold drops FOR THIS SIGNATURE next time.
 ```
+
+**Rungs [2b] and [2c] are both cheaper than the human — spend them first.** [2c] escalates
+*compute*: a hard case a frontier model can derive shouldn't cost an interruption — but only for
+**preventable** hardness (the answer exists, just hard to reach); **never** burn compute on
+**irreducible** ambiguity (§8), where no reasoning manufactures absent intent. [2b] borrows from the
+**cohort** (cross-user prior, §7): a fallback used only at low personal coverage, kept low-confidence
+and logged as *borrowed*, yielding instantly to your own signal, and **in-scope only** (free within
+an org/team; cross-org = abstracted patterns + consent, §9).
 
 **The trap to engineer against (rung 2):** "resolve silently from history" is the code-monitor's
 strength turned into the user-monitor's trap. Precedent ("how they fixed it before") is not current
@@ -251,13 +266,18 @@ pile of parts. The product is the assembly, and no one has assembled it on a rea
 Answer with the number: self-reflection **61.2%** vs. external supervisor **69.4%** (§12). Not a
 tuning gap — structural.
 
-**Two moats that survive even if a competitor copies the architecture tomorrow:**
+**Three moats that survive even if a competitor copies the architecture tomorrow:**
 1. **Domain-locked.** It works because `git revert` is *both* the free undo *and* the training
    label — the same action that fixes the mistake teaches the double. No other domain hands you
    that. Durable *because* it's coding-specific.
 2. **Per-user data flywheel.** Even a perfect clone of your code ships cold. Your double has *your*
    months of resolution history — uncopyable, and the switching cost compounds with use. "The more
    you use it, the better" is also "the more you use it, the more locked-in you are."
+3. **Cross-user network effect.** With many users, a new user's cold start is warmed by a
+   *data-driven cohort prior* (§7), and each resolution can improve similar users' doubles — so the
+   product gets better with *total* users, not just your own history. A stronger flywheel than #2
+   (Waze, not a private notebook). Bounded by the IP line: free within an org/team, abstracted
+   patterns only across orgs (§9).
 
 ---
 
@@ -340,8 +360,21 @@ It's not one problem.
   **repo**. "How does this codebase resolve this kind of ambiguity?" is answerable from the code —
   the **same index the code monitor already built.** Rung [1] works day zero. *This is why coding is
   the right scope.*
-- **Layer 1 — population prior.** For repo-unresolvable cases, fall back to "what would a careful
-  developer mean?" (base-model default). New user = cautious median, asks a bit more.
+- **Layer 1 — population prior, *configurable*.** For repo-unresolvable cases, fall back to a prior
+  — and let the user pick its strength (this is the §4 convenience↔correctness tradeoff applied to
+  cold start):
+    - **Clean start** — no cohort borrowing; pure personal + repo. Max privacy, purest *you*, slow ramp.
+    - **Average good** — start from a **data-driven cohort prior** ("developers like you"). Fast ramp,
+      decent defaults, but crowd-flavored early.
+    - **Bought expert** — seed from a *specific* expert's double (the marketplace premium tier, §9).
+
+  The knob sets the **ramp and the long tail, not the destination**: for any situation you personally
+  cover, your signal overrides the cohort, so clean and average *converge* on the head and differ only
+  on the rarely-hit tail. Two **independent consent toggles** — *receive* a cohort prior / *contribute*
+  your resolutions (cross-org contribute = abstracted patterns only, §9). Defaults: within-team →
+  cohort on (institutional memory); individual / cross-org → clean by default, cohort opt-in.
+  *(Advanced: set it per situation-class — borrow the crowd for common/low-stakes, stay clean for your
+  distinctive, high-stakes judgment.)*
 - **Layer 2 — fast personalization, not training.** The double is **in-context/retrieval, not
   fine-tuned** → a *single* resolution event is usable immediately. Cold start ends not after N
   examples but after the *first* resolution **per situation-class**. *Verified backing (§12):*
@@ -434,7 +467,10 @@ double **stays in-house**, which sidesteps the marketplace's worst problem (IP, 
 
 **Step 3 — The consumer marketplace (the future, last).** People sell their doubles online: a top
 engineer's judgment, packaged and bought. Compelling — and the natural endpoint of *reusable +
-owned*. But three hard problems make it phase-3, not the wedge:
+owned*. It is also the **premium tier of the cross-user spectrum** (§7): *clean start* → free
+*average cohort* prior → *bought specific-expert* double — the marketplace just sells a **named**
+prior instead of the anonymous average (same axis, higher price, same IP problems in sharper form).
+But three hard problems make it phase-3, not the wedge:
 
 1. **Personal doesn't transfer — a *sold* double is a weaker, more copyable product.** The moat was
    "learns *your* judgment from *your* behavior." A *bought* double learns from someone else's, so
