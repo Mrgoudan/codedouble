@@ -40,7 +40,8 @@ This document is the design discussion, not a finished spec. Open questions are 
   intervention (interrupt / correct / reject / revert) is a failure signal* — drive **preventable**
   to zero, make **irreducible** ("I'll know it when I see it") cheap (§4); `git revert` cleanest,
   not primary; never count never-viewed. **Positives matter too** — *confirmed-good* (reviewed
-  wholesale accept) is the signal that lowers the threshold. Capture per-decision, learn per-session.
+  wholesale accept) is the signal that lowers the threshold. Record faithfully per-decision; reflect
+(label + distill) at session end.
 - **§7 Cold start** — never *fully* cold (the repo **and its git history** are a prior); retrieval
   not training → useful from the first event; mine commit history to pre-warm; **configurable cohort
   prior** (clean start / average / bought-expert).
@@ -363,6 +364,19 @@ revert of file X = precise negatives); the **session outcome labels the rest** (
 the natural **measurement window** for §8. Trade-off: session labels are coarser (they can't pin
 *which* decision mattered) — which is exactly why the precise per-decision interventions carry the
 fine signal and the session outcome only fills the gaps.
+
+**Two phases: faithful record (hot path) → reflect (session end).** During the session, *record
+faithfully and judge nothing* — log the raw event stream (intents, actions, interventions, `viewed`,
+diffs, SHAs, timestamps) losslessly and unopinionated. All interpretation waits for a single
+**reflection pass at session end**: credit assignment, correction-vs-iteration classification,
+distillation of raw events → stable preference statements, signature extraction, index/persona
+update, and (if opted in) abstract-then-contribute to the cohort (§7 — reflection is the single
+chokepoint where the IP boundary is enforced). Two payoffs: the hot path stays cheap and never slows
+the executor; and because the raw log is **event-sourced ground truth**, a wrong signature or
+labeling rule is fixed by **re-reflecting over the faithful log, not re-collecting** — which de-risks
+the make-or-break signature design (§10). Durable learning lands only at reflection; *within* a
+session the double still won't repeat a just-corrected mistake, because the recent raw events sit in
+its live context — that's ephemeral, not an index commit.
 
 **"All intervention is failure" is the right lens — but failure splits two ways.** Default-assume
 every intervention was preventable; that keeps the double honest (the opposite of silent-accept
