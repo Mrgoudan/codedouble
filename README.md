@@ -40,7 +40,7 @@ This document is the design discussion, not a finished spec. Open questions are 
   intervention (interrupt / correct / reject / revert) is a failure signal* — drive **preventable**
   to zero, make **irreducible** ("I'll know it when I see it") cheap (§4); `git revert` cleanest,
   not primary; never count never-viewed. **Positives matter too** — *confirmed-good* (reviewed
-  wholesale accept) is the signal that lowers the threshold.
+  wholesale accept) is the signal that lowers the threshold. Capture per-decision, learn per-session.
 - **§7 Cold start** — never *fully* cold (the repo **and its git history** are a prior); retrieval
   not training → useful from the first event; mine commit history to pre-warm; **configurable cohort
   prior** (clean start / average / bought-expert).
@@ -351,6 +351,18 @@ come *down*** — the §8 "rate falling" claim is impossible without them. A pos
 with **evidence of review**: reviewed-wholesale-accept is gold, never-viewed is *zero*. And
 **legibility earns it** — the double's clear breakdown is what turns a wholesale accept into a real
 endorsement rather than a rubber stamp (the transparency of §3 paying off as signal).
+
+**Granularity: capture per *decision*, label and learn per *session*.** The raw `resolution_event`
+is logged **per decision** — it must be, because the index is keyed by `situation_signature` and
+retrieval matches a new situation to past *decisions*, not whole sessions. But **outcomes and the
+reflection/distillation pass run per session** (best defined git-aligned: a branch / PR / task),
+because that's how users actually react — they don't grade each answer, they merge the PR, ship it,
+or redo it. **Credit assignment:** explicit interventions label *their* decision (override at turn 5,
+revert of file X = precise negatives); the **session outcome labels the rest** (merged-clean →
+`confirmed-good` for the un-intervened decisions; reverted / abandoned → negative). Session is also
+the natural **measurement window** for §8. Trade-off: session labels are coarser (they can't pin
+*which* decision mattered) — which is exactly why the precise per-decision interventions carry the
+fine signal and the session outcome only fills the gaps.
 
 **"All intervention is failure" is the right lens — but failure splits two ways.** Default-assume
 every intervention was preventable; that keeps the double honest (the opposite of silent-accept
