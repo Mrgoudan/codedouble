@@ -39,7 +39,8 @@ This document is the design discussion, not a finished spec. Open questions are 
 - **§6 Data layer** — log `resolution_event`s; `situation_signature` is make-or-break; *every user
   intervention (interrupt / correct / reject / revert) is a failure signal* — drive **preventable**
   to zero, make **irreducible** ("I'll know it when I see it") cheap (§4); `git revert` cleanest,
-  not primary; never count never-viewed.
+  not primary; never count never-viewed. **Positives matter too** — *confirmed-good* (reviewed
+  wholesale accept) is the signal that lowers the threshold.
 - **§7 Cold start** — never *fully* cold (the repo **and its git history** are a prior); retrieval
   not training → useful from the first event; mine commit history to pre-warm; **configurable cohort
   prior** (clean start / average / bought-expert).
@@ -324,6 +325,7 @@ a **failure signal**. The cheapest arrive *seconds* after the mistake, before co
 compounding (§4); `git revert` is the *cleanest* but the *latest*. **Treat intervention as the unit
 you count and drive down.**
 
+*Negatives (raise the threshold — "be more careful here"):*
 - **interrupt** — user *halts* the agent mid-execution. The **earliest and among the strongest**
   negatives — they couldn't even let it finish.
 - **override** — agent silently resolved an under-determined point as X; user corrected to Y (X→Y).
@@ -332,8 +334,23 @@ you count and drive down.**
 - **revert** — user undid a *committed* change (`git revert`/`checkout`). The *cleanest* unambiguous
   negative (timestamped, free from the medium — the moat, §5), but the **latest**: it only fires
   after the user shipped and lived with the mistake.
-- **answered** — human answered a clarifying question. Strongest positive, rarest, worth ~100× a silent-accept.
-- **accepted (silent)** — weak positive; **down-weight hard, time-decay, and never count never-viewed as positive.**
+
+*Positives (lower the threshold — "you got this right, act silently next time"):*
+- **confirmed-good** — the double reasoned it out, **laid the breakdown out legibly**, and the user
+  **reviewed and accepted it wholesale** (accept-all on a diff/plan, merged unchanged, "yes, all of
+  that"). The **confident-and-RIGHT** event — the mirror of `override`, and the strongest
+  *calibration* positive: acting silently was vindicated → the threshold drops for this signature.
+- **answered** — human answered a clarifying question. The strongest *content* positive (gives the
+  right reading directly) and confirms the ask was warranted; rarest, worth ~100× a silent-accept.
+- **accepted (silent)** — weak positive **only if `viewed`**; **down-weight hard, time-decay, and
+  never count never-viewed as positive** (that's silent-accept poison, §4, not endorsement).
+
+**Why positives are not optional.** Negatives alone only ever say "be more careful" → the threshold
+drifts *up* → the double regresses to the "always ask" tool. **Positives are what make the threshold
+come *down*** — the §8 "rate falling" claim is impossible without them. A positive's strength scales
+with **evidence of review**: reviewed-wholesale-accept is gold, never-viewed is *zero*. And
+**legibility earns it** — the double's clear breakdown is what turns a wholesale accept into a real
+endorsement rather than a rubber stamp (the transparency of §3 paying off as signal).
 
 **"All intervention is failure" is the right lens — but failure splits two ways.** Default-assume
 every intervention was preventable; that keeps the double honest (the opposite of silent-accept
@@ -432,7 +449,10 @@ experienced user.
 This is the sharpest *slice* of a broader health number: the **total intervention rate** (§6) —
 every interrupt / correction / rejection / revert per unit of work — trending toward its
 *irreducible floor* (the "I'll know it when I see it" residue no calibration can remove). The double
-is working when **preventable** intervention falls and only the structural floor remains.
+is working when **preventable** intervention falls and only the structural floor remains. Measure it
+over **reviewed** decisions only — a never-viewed accept is neither success nor failure (§6); the
+positive complement is **confirmed-good** (reviewed wholesale acceptance), and a healthy curve shows
+that *rising* as override/revert *falls*.
 
 **This is the gate before the marketplace.** Everything in §9 is worthless if this curve is flat.
 Every published paper measures this against a *simulated* user — and a 2026 real-human study (**Lost
