@@ -41,7 +41,8 @@ This document is the design discussion, not a finished spec. Open questions are 
   to zero, make **irreducible** ("I'll know it when I see it") cheap (§4); `git revert` cleanest,
   not primary; never count never-viewed. **Positives matter too** — *confirmed-good* (reviewed
   wholesale accept) is the signal that lowers the threshold. Record faithfully per-decision; reflect
-(label + distill) at session end.
+(label + distill) at session end. **Calibrated reflection:** distill a rule only from repeated /
+consistent signal — confidently learning the wrong lesson = an automated mask *inside* the loop.
 - **§7 Cold start** — never *fully* cold (the repo **and its git history** are a prior); retrieval
   not training → useful from the first event; mine commit history to pre-warm; **configurable cohort
   prior** (clean start / average / bought-expert).
@@ -377,6 +378,35 @@ labeling rule is fixed by **re-reflecting over the faithful log, not re-collecti
 the make-or-break signature design (§10). Durable learning lands only at reflection; *within* a
 session the double still won't repeat a just-corrected mistake, because the recent raw events sit in
 its live context — that's ephemeral, not an index commit.
+
+**Calibrated reflection — the double must not learn the *wrong* thing.** Reflection faces two
+*under-determined* inferences — the §2 problem turned inward:
+- **Credit assignment** — many decisions, one fuzzy outcome: which decision earned the merge, which
+  caused the revert three commits later?
+- **Distillation** — "user changed X→Y" could mean *prefers Y* (a rule), *this file needed Y*
+  (narrow), or *changed their mind once* (nothing). Same behavior, multiple lessons.
+
+**The danger:** if reflection **confidently extracts the wrong lesson**, it bakes an *automated mask
+of the user* into the index (§1, §3) — the double becomes confidently-wrong *about you*, the exact
+failure it exists to prevent, now living **inside the learning loop**. So the make-or-break is not
+"can it learn" but "**can it avoid learning the wrong thing.**"
+
+**The fix is self-similar — point the double's own discipline back at reflection:**
+- **Calibrated lesson-extraction** — one X→Y stays a *raw event* (weak, retrievable); only
+  **repeated, consistent** signals distill into a **preference rule**. (The §3 "high confidence gates
+  silent action" rule, applied to *what becomes a rule*.)
+- **Generalization is a hypothesis, not a fact** — reflection *proposes* the altitude; later behavior
+  confirms or narrows it (§6 above). Never commit an altitude from one event.
+- **Transparency + veto** — every distilled rule is visible ("the double now thinks you prefer Y")
+  and deletable. A wrong lesson is correctable precisely because it's a *record, not a weight* —
+  which is the whole reason the model stays frozen and learning lives in the index.
+- **Escalate when genuinely ambiguous** — keep it raw, or (rarely) ask: "a preference, or just this
+  once?" Same escalation ladder, pointed at the learning step; the answer is a gold label.
+
+**The payoff:** one discipline runs at *both* layers — **advising** the user (don't act confidently
+on under-determined intent) and **learning** from the user (don't learn confidently from
+under-determined behavior). The thing that makes the double safe is the same thing that makes its
+learning safe.
 
 **"All intervention is failure" is the right lens — but failure splits two ways.** Default-assume
 every intervention was preventable; that keeps the double honest (the opposite of silent-accept
