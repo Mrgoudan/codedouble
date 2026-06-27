@@ -1,4 +1,0 @@
-numpy>=1.20
-
-[real]
-sentence-transformers>=2.2

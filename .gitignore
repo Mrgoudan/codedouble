@@ -3,3 +3,7 @@ __pycache__/
 *.jsonl
 .codedouble/
 report*.html
+*.egg-info/
+.eggs/
+build/
+dist/
