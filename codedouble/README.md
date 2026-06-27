@@ -55,10 +55,35 @@ This validates the **mechanism**, not the thesis. The simulated user has a
 cluster into consistent resolutions. That clustering is the make-or-break
 (README §10), and only real developers can answer it.
 
-To pressure-test toward reality, swap the defaults behind the same interfaces:
-- `HashingEmbedder` → a real code embedder (CodeBERT / a sentence-transformer)
-- `RuleBasedExtractor` → an `LLMExtractor` calling Mistral/Claude
-- the simulated user → a logger riding a real coding agent (the actual §10 step)
+## Real models (the model is in)
 
-Then re-measure the §8 curve on real overrides/reverts. If it bends, the idea
-has legs; if it doesn't, no model quality saves it.
+Real backends live in [backends.py](backends.py), behind the same interfaces.
+Switch with `CODEDOUBLE_BACKEND`:
+
+```bash
+python3 -m codedouble.demo                          # default — no model (hashing + rules)
+CODEDOUBLE_BACKEND=st      python3 -m codedouble.demo   # local sentence-transformers (CPU, no key)
+CODEDOUBLE_BACKEND=mistral python3 -m codedouble.demo   # mistral-embed + LLM-inferred fields (needs MISTRAL_API_KEY)
+```
+
+| Backend | Embedder | Extractor fields | Needs |
+|---|---|---|---|
+| `default` | `HashingEmbedder` (no model) | `RuleBasedExtractor` | nothing |
+| `st` | `STEmbedder` (sentence-transformers, CPU) | rule-based | `pip install sentence-transformers` |
+| `mistral` | `MistralEmbedder` (`mistral-embed`) | `LLMExtractor` (Mistral chat) | `MISTRAL_API_KEY` + network |
+
+`MistralClient` is stdlib-`urllib` only (no `requests`). `LLMExtractor` degrades
+to rule-based per field if the model is unreachable or returns garbage, and is
+unit-tested offline via `FakeLLM`.
+
+Verified here: the **`st` backend runs end-to-end on CPU** (MiniLM, 384-dim;
+similar/dissimilar cosine 0.81 vs 0.08; same falling §8 curve, ECE 0.020). The
+`mistral` path is wired and offline-tested; it needs a key + network to run live.
+
+## The make-or-break is still open
+
+Swapping in real models does **not** close the real question — the simulated
+user does. The honest §10 step is: replace the simulated user with a **logger
+riding a real coding agent**, collect real overrides/reverts, and re-measure the
+§8 curve. If it bends on real behavior, the idea has legs; if it doesn't, no
+embedder or LLM saves it.

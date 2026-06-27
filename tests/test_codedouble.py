@@ -18,6 +18,7 @@ from codedouble import (  # noqa: E402
     RuleBasedExtractor,
     reflect_session,
 )
+from codedouble.backends import FakeLLM, LLMExtractor  # noqa: E402
 from codedouble.double import gate  # noqa: E402
 from codedouble.embedder import cosine  # noqa: E402
 from codedouble.metrics import Record, section8_rate, ask_rate  # noqa: E402
@@ -102,6 +103,29 @@ class TestReflect(unittest.TestCase):
         summary = reflect_session(d.index, d.calibrator, records, now=d.now, min_promote=3)
         self.assertGreaterEqual(summary["rules_total"], 1)
         self.assertGreater(summary["calibration_observations"], 0)
+
+
+class TestLLMExtractor(unittest.TestCase):
+    def test_fake_llm_fills_fields(self):
+        emb = HashingEmbedder(64)
+        fake = FakeLLM({
+            "phrasing_class": "fix-it", "error_type": "null-deref",
+            "action_kind": "edit",
+            "interpretation_space": ["guard nulls", "return Option"],
+        })
+        sig = LLMExtractor(fake, emb).extract(
+            {"request": "do the thing", "error": "", "lang": "python"})
+        self.assertEqual(sig.phrasing_class, "fix-it")
+        self.assertEqual(sig.error_type, "null-deref")
+        self.assertEqual(sig.interpretation_space[0], "guard nulls")
+        self.assertIsNotNone(sig.code_vec)
+        self.assertEqual(fake.calls, 1)
+
+    def test_falls_back_on_garbage(self):
+        emb = HashingEmbedder(64)
+        ext = LLMExtractor(lambda p: "not json at all", emb)
+        sig = ext.extract({"request": "clean up the handler", "lang": "python"})
+        self.assertEqual(sig.phrasing_class, "clean-up")  # rule-based fallback
 
 
 class TestSection8Metric(unittest.TestCase):

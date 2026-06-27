@@ -33,6 +33,14 @@ from .signature import RuleBasedExtractor, SignatureExtractor
 from .index import Calibrator, ResolutionIndex, SemanticStore
 from .double import Double
 from .reflect import reflect_session
+from .backends import (
+    FakeLLM,
+    LLMExtractor,
+    MistralClient,
+    MistralEmbedder,
+    STEmbedder,
+    mistral_extractor,
+)
 from . import metrics
 
 __all__ = [
@@ -55,5 +63,11 @@ __all__ = [
     "SemanticStore",
     "Double",
     "reflect_session",
+    "FakeLLM",
+    "LLMExtractor",
+    "MistralClient",
+    "MistralEmbedder",
+    "STEmbedder",
+    "mistral_extractor",
     "metrics",
 ]

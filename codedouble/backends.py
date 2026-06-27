@@ -1,0 +1,222 @@
+"""Real model backends — the BERT (embedder) and Mistral (extractor) slots.
+
+These plug in behind the same `Embedder` / `SignatureExtractor` interfaces the
+no-model defaults use, so swapping them changes nothing else (README §11:
+models are swappable; the index is the moat).
+
+Nothing here is imported at package load unless you ask for it — the defaults
+stay dependency-free. Backends degrade gracefully: a missing key / package / net
+raises a clear error, and `LLMExtractor` falls back to rule-based per field.
+
+  - MistralClient   thin stdlib-urllib wrapper (chat + embeddings), no `requests`
+  - MistralEmbedder embeddings via `mistral-embed`            (the matcher slot)
+  - STEmbedder      local sentence-transformers (no API/GPU)  (the matcher slot)
+  - LLMExtractor    LLM-inferred signature fields             (the extractor slot)
+  - FakeLLM         canned-JSON completer for offline tests
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import urllib.error
+import urllib.request
+from typing import Callable, List, Optional
+
+import numpy as np
+
+from .embedder import Embedder
+from .signature import RuleBasedExtractor, SignatureExtractor
+from .types import Signature
+
+
+def _l2(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    return v / n if n > 0 else v
+
+
+# --------------------------------------------------------------------------- #
+# Mistral HTTP client (stdlib only)
+# --------------------------------------------------------------------------- #
+class MistralClient:
+    BASE = "https://api.mistral.ai/v1"
+
+    def __init__(self, api_key: Optional[str] = None, timeout: float = 60.0):
+        self.api_key = api_key or os.environ.get("MISTRAL_API_KEY")
+        self.timeout = timeout
+        if not self.api_key:
+            raise RuntimeError(
+                "MISTRAL_API_KEY not set. Export it, or use the no-model defaults "
+                "(HashingEmbedder + RuleBasedExtractor)."
+            )
+
+    def _post(self, path: str, payload: dict) -> dict:
+        req = urllib.request.Request(
+            f"{self.BASE}/{path}",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def chat(self, prompt: str, model: str = "mistral-small-latest",
+             system: Optional[str] = None, json_mode: bool = True) -> str:
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        payload = {"model": model, "messages": msgs, "temperature": 0}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        out = self._post("chat/completions", payload)
+        return out["choices"][0]["message"]["content"]
+
+    def embed(self, texts: List[str], model: str = "mistral-embed") -> List[List[float]]:
+        out = self._post("embeddings", {"model": model, "input": texts})
+        return [d["embedding"] for d in out["data"]]
+
+
+# --------------------------------------------------------------------------- #
+# Embedder backends (the matcher / BERT slot)
+# --------------------------------------------------------------------------- #
+class MistralEmbedder(Embedder):
+    """Embeddings via Mistral's `mistral-embed` (1024-dim). API key + net required."""
+
+    def __init__(self, client: Optional[MistralClient] = None, model: str = "mistral-embed"):
+        self.client = client or MistralClient()
+        self.model = model
+        self.dim = 1024
+
+    def embed(self, text: str) -> np.ndarray:
+        vec = self.client.embed([text or " "], model=self.model)[0]
+        return _l2(np.asarray(vec, dtype=np.float32))
+
+
+class STEmbedder(Embedder):
+    """Local sentence-transformers — no API, no GPU needed (CPU is fine).
+
+    Defaults to a small general model; pass a code-aware model for code
+    (e.g. 'flax-sentence-embeddings/st-codesearch-distilroberta-base').
+    Requires `pip install sentence-transformers`.
+    """
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        try:
+            from sentence_transformers import SentenceTransformer  # lazy
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError(
+                "sentence-transformers not installed. `pip install sentence-transformers` "
+                "or use HashingEmbedder / MistralEmbedder."
+            ) from e
+        self._model = SentenceTransformer(model_name)
+        self.dim = int(self._model.get_sentence_embedding_dimension())
+
+    def embed(self, text: str) -> np.ndarray:
+        v = self._model.encode(text or " ", normalize_embeddings=True)
+        return np.asarray(v, dtype=np.float32)
+
+
+# --------------------------------------------------------------------------- #
+# LLM extractor (the Mistral / reasoner slot for signatures)
+# --------------------------------------------------------------------------- #
+Completer = Callable[[str], str]  # prompt -> JSON string
+
+_EXTRACT_SYSTEM = (
+    "You label a software-engineering 'moment' so similar situations can be "
+    "retrieved later. Return ONLY a JSON object with keys: "
+    "phrasing_class (one of: clean-up, fix-it, make-like-X, add-feature, remove, other), "
+    "error_type (a short slug or null), "
+    "action_kind (one of: edit, delete, rename, refactor, add), "
+    "interpretation_space (array of 1-3 short plausible readings of the request)."
+)
+
+
+def _moment_prompt(moment: dict) -> str:
+    return (
+        "Label this moment:\n"
+        f"request: {moment.get('request','')}\n"
+        f"error: {moment.get('error','')}\n"
+        f"diff: {moment.get('diff','')[:800]}\n"
+        f"files: {list(moment.get('files',()) )}\n"
+        f"lang: {moment.get('lang','')}\n"
+    )
+
+
+def _parse_json(s: str) -> dict:
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.DOTALL)  # tolerate prose around the JSON
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return {}
+        return {}
+
+
+class LLMExtractor(SignatureExtractor):
+    """Infer the structured signature fields with an LLM; embed the fuzzy parts.
+
+    `complete` maps a prompt -> JSON string (e.g. `MistralClient().chat`). Any
+    field the LLM omits or malforms falls back to the rule-based extractor, so a
+    flaky model degrades rather than crashes.
+    """
+
+    def __init__(self, complete: Completer, embedder: Embedder,
+                 fallback: Optional[SignatureExtractor] = None):
+        self.complete = complete
+        self.embedder = embedder
+        self.fallback = fallback or RuleBasedExtractor(embedder)
+
+    def extract(self, moment: dict) -> Signature:
+        base = self.fallback.extract(moment)  # fields + embeddings as a floor
+        try:
+            data = _parse_json(self.complete(_moment_prompt(moment)))
+        except (urllib.error.URLError, RuntimeError, KeyError):
+            return base  # network/key failure -> rule-based result
+
+        base.phrasing_class = data.get("phrasing_class") or base.phrasing_class
+        if "error_type" in data:
+            base.error_type = data.get("error_type") or base.error_type
+        base.action_kind = data.get("action_kind") or base.action_kind
+        isp = data.get("interpretation_space")
+        if isinstance(isp, list) and isp:
+            base.interpretation_space = [str(x) for x in isp][:3]
+        return base
+
+
+class FakeLLM:
+    """Offline completer for tests — returns canned JSON, no network."""
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+        self.calls = 0
+
+    def __call__(self, prompt: str) -> str:
+        self.calls += 1
+        return json.dumps(self.payload)
+
+
+# --------------------------------------------------------------------------- #
+# convenience factory: the full Mistral extractor (embed + chat)
+# --------------------------------------------------------------------------- #
+def mistral_extractor(
+    client: Optional[MistralClient] = None,
+    chat_model: str = "mistral-small-latest",
+    embed_model: str = "mistral-embed",
+) -> LLMExtractor:
+    """Wire LLMExtractor with Mistral chat (field inference) + mistral-embed
+    (vectors). Needs MISTRAL_API_KEY + network."""
+    client = client or MistralClient()
+    emb = MistralEmbedder(client, model=embed_model)
+
+    def complete(prompt: str) -> str:
+        return client.chat(prompt, model=chat_model, system=_EXTRACT_SYSTEM, json_mode=True)
+
+    return LLMExtractor(complete, emb)

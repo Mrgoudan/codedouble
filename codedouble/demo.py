@@ -67,10 +67,11 @@ def make_moment(rng: random.Random, k: Klass) -> dict:
     }
 
 
-def run(rounds: int = 30, per_round: int = 20, drift_p: float = 0.04, seed: int = 7) -> List[Record]:
+def run(rounds: int = 30, per_round: int = 20, drift_p: float = 0.04, seed: int = 7,
+        extractor=None) -> List[Record]:
     rng = random.Random(seed)
-    embedder = HashingEmbedder(dim=256)
-    extractor = RuleBasedExtractor(embedder)
+    if extractor is None:
+        extractor = RuleBasedExtractor(HashingEmbedder(dim=256))
     calibrator = Calibrator()
     index = ResolutionIndex()
     double = Double(extractor, index, calibrator, conf_threshold=0.6)
@@ -109,8 +110,28 @@ def run(rounds: int = 30, per_round: int = 20, drift_p: float = 0.04, seed: int 
     return history, index, calibrator
 
 
+def build_backend():
+    """Pick the extractor/embedder from CODEDOUBLE_BACKEND:
+       default = no-model (HashingEmbedder + RuleBasedExtractor)
+       st      = local sentence-transformers embeddings + rule-based fields
+       mistral = mistral-embed + LLM-inferred fields (needs MISTRAL_API_KEY)
+    """
+    import os
+    backend = os.environ.get("CODEDOUBLE_BACKEND", "default").lower()
+    if backend == "mistral":
+        from .backends import mistral_extractor
+        print("[backend] mistral: mistral-embed + LLMExtractor(mistral-small)")
+        return mistral_extractor()
+    if backend == "st":
+        from .backends import STEmbedder
+        print("[backend] sentence-transformers (local embeddings)")
+        return RuleBasedExtractor(STEmbedder())
+    print("[backend] default: HashingEmbedder + RuleBasedExtractor (no model)")
+    return None
+
+
 def main() -> None:
-    history, index, calibrator = run()
+    history, index, calibrator = run(extractor=build_backend())
 
     print("Self-Learning Code Double — simulated-user demo")
     print("=" * 66)
