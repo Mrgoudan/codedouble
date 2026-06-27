@@ -2,16 +2,21 @@
   "name": "vscode-codedouble",
   "displayName": "CodeDouble Capture",
   "description": "Faithfully records editor interactions (accept / override / reject / viewed) into .codedouble/interactions.jsonl for the Self-Learning Code Double, with a live panel.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "codedouble",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "codedoubleSidebar", "title": "CodeDouble", "icon": "media/eye.svg" }
+      ]
+    },
     "views": {
-      "explorer": [
-        { "id": "codedouble.view", "name": "CodeDouble", "type": "webview" }
+      "codedoubleSidebar": [
+        { "id": "codedouble.view", "name": "Capture", "type": "webview" }
       ]
     },
     "commands": [
