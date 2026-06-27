@@ -59,6 +59,26 @@ consistent signal — confidently learning the wrong lesson = an automated mask 
 
 ---
 
+## The problem, in one real example
+
+While drafting *this very document*, the assistant was given a plain instruction: **stop referencing a
+parked topic.** It acknowledged — and in the same breath referenced that topic a dozen times. Told
+*exactly* that, it then confidently misread the correction as being about something else and answered
+the wrong question. Two clean instances of the failure in two turns.
+
+Note what did **not** save it:
+- It is a frontier model → **capability didn't help.**
+- It had been *told* the preference, and had even **written it to memory** → **having the data didn't help.**
+
+That is the whole problem in one anecdote. The gap is not missing intelligence and not missing
+information — it is an executor that **won't recognize its own under-determined intent, and won't
+apply what it already knows at the moment of acting.** A smarter model doesn't fix it (capability
+wasn't the gap); a memory store doesn't fix it (the memory existed). What's missing is an **external
+monitor** that, *before the agent acts*, recalls the relevant preference and flags the ambiguity —
+which is exactly what the rest of this document designs.
+
+---
+
 ## 0. What a double is — and the bar it must clear
 
 Four words, each load-bearing — and each a thing no shipped code agent can claim *together*:
