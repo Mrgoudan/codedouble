@@ -1,11 +1,13 @@
 // CodeDouble Capture — records editor interactions (accept / override / reject /
-// viewed) into .codedouble/interactions.jsonl (same schema the Python CLI reads),
-// with a live activity-bar sidebar and a brief highlight so you can SEE it work.
+// viewed) into the GLOBAL ~/.codedouble/interactions.jsonl (same schema + path the
+// Python CLI defaults to), so the double learns across ALL VS Code windows / repos,
+// with a live panel and a brief highlight so you can SEE it work.
 //
 // Capture in the editor; analysis/visualization in Python:
 //   python3 -m codedouble.cli report   (or: codedouble report)
 
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 
@@ -30,12 +32,18 @@ function cfg<T>(key: string, dflt: T): T {
   return vscode.workspace.getConfiguration("codedouble").get<T>(key, dflt);
 }
 
-function logPath(): string | undefined {
-  const ws = vscode.workspace.workspaceFolders;
-  if (!ws || !ws.length) return undefined;
-  const dir = path.join(ws[0].uri.fsPath, ".codedouble");
-  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
-  return path.join(dir, "interactions.jsonl");
+// GLOBAL, machine-wide store by default so the double learns across ALL VS Code
+// windows / repos (the original proposal). Matches the Python CLI default
+// (~/.codedouble). Override with CODEDOUBLE_LOG (file) or CODEDOUBLE_HOME (dir).
+function logPath(): string {
+  const envLog = process.env.CODEDOUBLE_LOG;
+  if (envLog) {
+    try { fs.mkdirSync(path.dirname(envLog), { recursive: true }); } catch { /* ignore */ }
+    return envLog;
+  }
+  const home = process.env.CODEDOUBLE_HOME || path.join(os.homedir(), ".codedouble");
+  try { fs.mkdirSync(home, { recursive: true }); } catch { /* ignore */ }
+  return path.join(home, "interactions.jsonl");
 }
 
 const LANG: Record<string, string> = {
@@ -74,10 +82,12 @@ function record(
   const lp = logPath();
   if (!lp) return;
   const rel = vscode.workspace.asRelativePath(doc.uri);
+  const wsf = vscode.workspace.getWorkspaceFolder(doc.uri);
+  const repo = wsf ? wsf.uri.fsPath : "";
   const rec = {
     ts: Date.now() / 1000, source: "editor", request: `${actionKind} ${rel}`,
     diff: diff.slice(0, 2000), error: "", lang: LANG[doc.languageId] ?? doc.languageId,
-    files: [rel], action_kind: actionKind, reversibility: reversibilityOf(doc, actionKind),
+    repo, files: [rel], action_kind: actionKind, reversibility: reversibilityOf(doc, actionKind),
     outcome, resolution, corrected_from: correctedFrom, sha: null,
   };
   try {
@@ -204,7 +214,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       <h4>Outcomes</h4><div id="tally"></div>
       <h4>Recent</h4><ul id="recent"></ul>
       <button id="report">Open report ▸</button>
-      <div class="muted">Edits are recorded to .codedouble/interactions.jsonl</div>
+      <div class="muted">Global store: ~/.codedouble/interactions.jsonl (all windows)</div>
       <script>
         const COLORS={override:'#d9534f',revert:'#d9534f',interrupt:'#d9534f',
           confirmed_good:'#5cb85c',answered:'#5cb85c',accepted_silent:'#888',never_viewed:'#bbb'};

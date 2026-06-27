@@ -23,7 +23,22 @@ from .double import Double
 from .metrics import Record
 from .types import Action, Outcome, Reversibility
 
-DEFAULT_LOG = os.path.join(".codedouble", "interactions.jsonl")
+def codedouble_home() -> str:
+    """Machine-wide data dir. Override with CODEDOUBLE_HOME."""
+    h = os.environ.get("CODEDOUBLE_HOME")
+    return os.path.expanduser(h) if h else os.path.join(os.path.expanduser("~"), ".codedouble")
+
+
+def default_log() -> str:
+    """Global by default — the double learns across ALL repos and editor windows
+    (the original proposal: whole-computer level, not per-repo). Override with
+    CODEDOUBLE_LOG (a file), CODEDOUBLE_HOME (a dir), or --log. A per-project
+    store is opt-in (`--log .codedouble/interactions.jsonl`)."""
+    p = os.environ.get("CODEDOUBLE_LOG")
+    return os.path.expanduser(p) if p else os.path.join(codedouble_home(), "interactions.jsonl")
+
+
+DEFAULT_LOG = default_log()
 
 _EXT_LANG = {
     ".py": "python", ".ts": "ts", ".tsx": "ts", ".js": "ts", ".jsx": "ts",
@@ -146,7 +161,7 @@ def capture_git(log: EventLog, repo: str = ".", max_commits: int = 500, quiet: b
         is_revert = subject.lower().startswith("revert") or ak == "revert"
         rec = {
             "ts": float(ct), "source": "git", "request": subject, "diff": "",
-            "error": "", "lang": _lang_of(files), "repo": repo, "files": files[:20],
+            "error": "", "lang": _lang_of(files), "repo": os.path.abspath(repo), "files": files[:20],
             "action_kind": ak, "reversibility": infer_reversibility(ak, files),
             "outcome": (Outcome.REVERT.value if is_revert else Outcome.ACCEPTED_SILENT.value),
             "resolution": subject, "corrected_from": None, "sha": sha,
