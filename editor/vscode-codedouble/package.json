@@ -1,0 +1,39 @@
+{
+  "name": "vscode-codedouble",
+  "displayName": "CodeDouble Capture",
+  "description": "Faithfully records editor interactions (accept / override / reject / viewed) into .codedouble/interactions.jsonl for the Self-Learning Code Double.",
+  "version": "0.1.0",
+  "publisher": "codedouble",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "codedouble.acceptReviewed", "title": "CodeDouble: Accept selection (reviewed, wholesale)" },
+      { "command": "codedouble.markOverride", "title": "CodeDouble: Mark selection as an override (I changed the AI's code)" },
+      { "command": "codedouble.reject", "title": "CodeDouble: Reject / interrupt (this was wrong)" },
+      { "command": "codedouble.openReport", "title": "CodeDouble: Open report (run report)" },
+      { "command": "codedouble.toggle", "title": "CodeDouble: Toggle capture on/off" }
+    ],
+    "configuration": {
+      "title": "CodeDouble",
+      "properties": {
+        "codedouble.enabled": { "type": "boolean", "default": true, "description": "Capture interactions." },
+        "codedouble.minInsertLines": { "type": "number", "default": 3, "description": "A single change inserting at least this many lines is treated as a proposal (likely AI/paste)." },
+        "codedouble.minInsertChars": { "type": "number", "default": 80, "description": "...or at least this many characters in one change." },
+        "codedouble.overrideWindowMs": { "type": "number", "default": 120000, "description": "If a proposal's region is edited within this window, it's an OVERRIDE." },
+        "codedouble.settleMs": { "type": "number", "default": 90000, "description": "A proposal not edited within this window is finalized as accepted." }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.4.0"
+  }
+}
