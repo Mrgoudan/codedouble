@@ -80,6 +80,40 @@ Verified here: the **`st` backend runs end-to-end on CPU** (MiniLM, 384-dim;
 similar/dissimilar cosine 0.81 vs 0.08; same falling §8 curve, ECE 0.020). The
 `mistral` path is wired and offline-tested; it needs a key + network to run live.
 
+## Turn it on — monitor real interactions (the §10 logger)
+
+```bash
+python3 -m codedouble.cli on        # mine your git history + install a post-commit hook
+python3 -m codedouble.cli report    # replay your real log -> ASCII sparkline + report.html
+python3 -m codedouble.cli status    # what's captured, is the hook on
+python3 -m codedouble.cli report --sim   # the same visual on the simulated user (guaranteed rich)
+```
+
+`on` does two things: mines existing commits into `.codedouble/interactions.jsonl`
+(reverts → negative labels, README §7) and installs a `.git/hooks/post-commit`
+hook so **every future commit is recorded** (cheap faithful record on the hot
+path; embedding + analysis happen at `report` time — the two-phase design, §6).
+`report` runs the **real embedder by default** and writes a dependency-free
+HTML/SVG chart of the §8 curve, ask-rate, and accuracy.
+
+You can also teach it one interaction at a time:
+```bash
+python3 -m codedouble.cli log "clean up the auth module" "extract-helper" --outcome confirmed_good
+```
+
+What I cannot do: silently watch your keystrokes/IDE — a true live monitor needs
+an editor extension calling `record_interaction()` (the accept/reject/override
+signals are the richest source). The git hook + manual `log` are the real
+surfaces available without one.
+
+### Honest first result on real data
+
+Replaying this repo's own git history shows **§8 = n/a** — the double just
+*asks*, because commit *subjects* don't cluster (every subject is unique). That
+is the make-or-break, surfacing immediately: git-subject signatures alone don't
+cluster. Richer capture (diffs, accept/reject, file-scoped overrides) is what
+would make them cluster — exactly what the next step has to test.
+
 ## The make-or-break is still open
 
 Swapping in real models does **not** close the real question — the simulated

@@ -64,3 +64,23 @@ def windowed_section8(
         rate, n = section8_rate(chunk, conf_threshold)
         out.append((i // window, rate, n))
     return out
+
+
+def window_stats(
+    records: List[Record], window: int = 40, conf_threshold: float = 0.6
+) -> List[dict]:
+    """Per-window rollup for visualization: §8 rate, ask-rate, accuracy, n."""
+    rows = []
+    for i in range(0, len(records), window):
+        chunk = records[i : i + window]
+        s8, n = section8_rate(chunk, conf_threshold)
+        rows.append(
+            {
+                "i": i // window,
+                "s8": s8,
+                "ask": ask_rate(chunk),
+                "acc": accuracy(chunk),
+                "n": n,
+            }
+        )
+    return rows

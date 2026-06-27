@@ -19,6 +19,8 @@ from codedouble import (  # noqa: E402
     reflect_session,
 )
 from codedouble.backends import FakeLLM, LLMExtractor  # noqa: E402
+from codedouble.logger import EventLog, record_interaction, replay  # noqa: E402
+from codedouble.viz import render_html  # noqa: E402
 from codedouble.double import gate  # noqa: E402
 from codedouble.embedder import cosine  # noqa: E402
 from codedouble.metrics import Record, section8_rate, ask_rate  # noqa: E402
@@ -143,6 +145,31 @@ class TestSection8Metric(unittest.TestCase):
         self.assertLess(lr, 0.35)                       # falls to a small floor
         self.assertLess(ask_rate(late), ask_rate(early))  # asks less over time
         self.assertGreater(len(index.events), 100)
+
+
+class TestLoggerViz(unittest.TestCase):
+    def test_capture_replay_render(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        log = EventLog(os.path.join(d, "i.jsonl"))
+        for _ in range(6):
+            record_interaction(log, "fix the login token", "guard-with-Option",
+                               "confirmed_good", lang="python")
+        raw = log.read()
+        self.assertEqual(len(raw), 6)
+
+        ext = RuleBasedExtractor(HashingEmbedder(128))
+        recs, double = replay(raw, ext)
+        self.assertEqual(len(recs), 6)
+        # first sees no precedent -> asks; later identical moments -> confident act
+        self.assertEqual(recs[0].decision.action, Action.ASK)
+        self.assertTrue(any(r.decision.action is not Action.ASK for r in recs[1:]))
+
+        out = os.path.join(d, "r.html")
+        render_html(recs, path=out, window=3)
+        self.assertTrue(os.path.exists(out))
+        with open(out) as f:
+            self.assertIn("<svg", f.read())
 
 
 if __name__ == "__main__":
