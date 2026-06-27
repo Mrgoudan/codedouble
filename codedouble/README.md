@@ -66,15 +66,34 @@ CODEDOUBLE_BACKEND=st      python3 -m codedouble.demo   # local sentence-transfo
 CODEDOUBLE_BACKEND=mistral python3 -m codedouble.demo   # mistral-embed + LLM-inferred fields (needs MISTRAL_API_KEY)
 ```
 
-| Backend | Embedder | Extractor fields | Needs |
+| Backend | Embedder (retrieval) | Extractor (reasoning) | Needs |
 |---|---|---|---|
 | `default` | `HashingEmbedder` (no model) | `RuleBasedExtractor` | nothing |
-| `st` | `STEmbedder` (sentence-transformers, CPU) | rule-based | `pip install sentence-transformers` |
-| `mistral` | `MistralEmbedder` (`mistral-embed`) | `LLMExtractor` (Mistral chat) | `MISTRAL_API_KEY` + network |
+| `st` / `real` | `STEmbedder` (sentence-transformers, CPU) | rule-based | `pip install sentence-transformers` |
+| `ollama` | `STEmbedder` (CPU) | `LLMExtractor` on a **local** Ollama model | `ollama serve` + a pulled model |
+| `mistral` | `MistralEmbedder` (`mistral-embed`) | `LLMExtractor` (Mistral cloud) | `MISTRAL_API_KEY` + network |
 
 `MistralClient` is stdlib-`urllib` only (no `requests`). `LLMExtractor` degrades
 to rule-based per field if the model is unreachable or returns garbage, and is
 unit-tested offline via `FakeLLM`.
+
+**Both slots local, no cloud (`ollama`).** Retrieval = sentence-transformers on
+CPU; reasoning = a local LLM via [Ollama](https://ollama.com) — no API key, fully
+offline once pulled. Pick the model with `CODEDOUBLE_OLLAMA_MODEL` (default
+`mistral`):
+
+```bash
+ollama pull mistral                                              # ~4 GB, snappy on CPU
+CODEDOUBLE_OLLAMA_MODEL=mistral codedouble report --backend ollama
+# or reuse a model you already have:
+CODEDOUBLE_OLLAMA_MODEL=BishengCMate:latest codedouble report --backend ollama
+```
+
+Reality check: a big model (e.g. a 30 GB one) needs RAM ≥ its size or it
+memory-maps from disk and crawls — run those on a high-RAM host; on a 16–32 GB
+laptop pull a small model (`mistral`, `qwen2.5:7b`). Keep the **per-call gateway
+hook on hashing** regardless — loading any LLM per tool call is too slow; the
+local LLM is for batch `report`/reflection.
 
 Verified here: the **`st` backend runs end-to-end on CPU** (MiniLM, 384-dim;
 similar/dissimilar cosine 0.81 vs 0.08; same falling §8 curve, ECE 0.020). The

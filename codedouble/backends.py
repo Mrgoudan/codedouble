@@ -206,6 +206,42 @@ class FakeLLM:
 # --------------------------------------------------------------------------- #
 # convenience factory: the full Mistral extractor (embed + chat)
 # --------------------------------------------------------------------------- #
+class OllamaClient:
+    """Local LLM via Ollama (no API key, no cloud). Talks to a running
+    `ollama serve` at OLLAMA_HOST (default http://localhost:11434)."""
+
+    def __init__(self, model: str = "mistral", host: Optional[str] = None, timeout: float = 120.0):
+        self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+        self.model = os.environ.get("CODEDOUBLE_OLLAMA_MODEL", model)
+        self.timeout = timeout
+
+    def chat(self, prompt: str, system: Optional[str] = None, json_mode: bool = True) -> str:
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        payload = {"model": self.model, "messages": msgs, "stream": False,
+                   "options": {"temperature": 0}}
+        if json_mode:
+            payload["format"] = "json"
+        req = urllib.request.Request(
+            self.host + "/api/chat", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())["message"]["content"]
+
+
+def ollama_extractor(embedder: Embedder, model: str = "mistral") -> LLMExtractor:
+    """LLMExtractor whose reasoning runs on a LOCAL Ollama model; embeddings come
+    from the given (local) embedder. Fully offline once the model is pulled."""
+    client = OllamaClient(model=model)
+
+    def complete(prompt: str) -> str:
+        return client.chat(prompt, system=_EXTRACT_SYSTEM, json_mode=True)
+
+    return LLMExtractor(complete, embedder)
+
+
 def mistral_extractor(
     client: Optional[MistralClient] = None,
     chat_model: str = "mistral-small-latest",

@@ -42,6 +42,21 @@ def build_extractor(backend: str):
         from .backends import mistral_extractor
         print("[backend] mistral (mistral-embed + LLM extractor)")
         return mistral_extractor()
+    if backend in ("ollama", "local"):
+        # reasoning on a LOCAL Ollama model + local embedder (no key, no cloud).
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        try:
+            from .backends import STEmbedder
+            emb = STEmbedder()
+            emb_name = "sentence-transformers"
+        except Exception:
+            emb = HashingEmbedder(256)
+            emb_name = "hashing"
+        from .backends import ollama_extractor
+        model = os.environ.get("CODEDOUBLE_OLLAMA_MODEL", "mistral")
+        print(f"[backend] ollama (local LLM reasoning: {model}) + {emb_name} retrieval")
+        return ollama_extractor(emb, model=model)
     if backend in ("real", "st", "auto"):
         # offline-first: use the cached model if present, NEVER hit the network
         # (avoids the HF HEAD-check + 5x retry hang on an offline machine).
@@ -263,7 +278,8 @@ def main(argv=None):
     p.add_argument("--lang", default=""); p.set_defaults(func=cmd_log)
 
     p = sub.add_parser("report", help="replay the log -> ASCII + report.html")
-    p.add_argument("--backend", default="real", help="real | mistral | default")
+    p.add_argument("--backend", default="real",
+                   help="real (local ST embedder) | ollama (local LLM reasoning) | mistral | default")
     p.add_argument("--window", type=int, default=40)
     p.add_argument("--conf", type=float, default=0.6)
     p.add_argument("--out", default="report.html")
