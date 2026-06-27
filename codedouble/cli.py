@@ -42,13 +42,19 @@ def build_extractor(backend: str):
         from .backends import mistral_extractor
         print("[backend] mistral (mistral-embed + LLM extractor)")
         return mistral_extractor()
-    if backend in ("real", "st"):
+    if backend in ("real", "st", "auto"):
+        # offline-first: use the cached model if present, NEVER hit the network
+        # (avoids the HF HEAD-check + 5x retry hang on an offline machine).
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         try:
             from .backends import STEmbedder
-            print("[backend] real: sentence-transformers (CPU)")
-            return RuleBasedExtractor(STEmbedder())
+            emb = STEmbedder()
+            print("[backend] real: sentence-transformers (CPU, offline/cached)")
+            return RuleBasedExtractor(emb)
         except Exception as e:
-            print(f"[backend] real embedder unavailable ({e}); using hashing")
+            print(f"[backend] real embedder not available offline ({type(e).__name__}); "
+                  f"using the no-model hashing embedder instead")
             return RuleBasedExtractor(HashingEmbedder(256))
     print("[backend] default: hashing (no model)")
     return RuleBasedExtractor(HashingEmbedder(256))
