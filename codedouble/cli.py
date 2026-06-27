@@ -36,7 +36,20 @@ from .signature import RuleBasedExtractor
 from .viz import ascii_report, render_html
 
 
-def build_extractor(backend: str):
+def resolve_ollama_model(model: str = None) -> str:
+    """Which local model to use: --model arg > CODEDOUBLE_OLLAMA_MODEL > first
+    installed model > 'mistral'. So it 'just works' with whatever you've pulled."""
+    if model:
+        return model
+    env = os.environ.get("CODEDOUBLE_OLLAMA_MODEL")
+    if env:
+        return env
+    from .backends import list_ollama_models
+    installed = list_ollama_models()
+    return installed[0] if installed else "mistral"
+
+
+def build_extractor(backend: str, model: str = None):
     backend = (backend or "real").lower()
     if backend == "mistral":
         from .backends import mistral_extractor
@@ -54,9 +67,9 @@ def build_extractor(backend: str):
             emb = HashingEmbedder(256)
             emb_name = "hashing"
         from .backends import ollama_extractor
-        model = os.environ.get("CODEDOUBLE_OLLAMA_MODEL", "mistral")
-        print(f"[backend] ollama (local LLM reasoning: {model}) + {emb_name} retrieval")
-        return ollama_extractor(emb, model=model)
+        m = resolve_ollama_model(model)
+        print(f"[backend] ollama (local LLM reasoning: {m}) + {emb_name} retrieval")
+        return ollama_extractor(emb, model=m)
     if backend in ("real", "st", "auto"):
         # offline-first: use the cached model if present, NEVER hit the network
         # (avoids the HF HEAD-check + 5x retry hang on an offline machine).
@@ -107,7 +120,8 @@ def cmd_report(args):
             print("run:  python3 -m codedouble.cli on        (mine git + monitor going forward)")
             print("  or: python3 -m codedouble.cli report --sim   (see it on the simulated user)")
             return
-        history, double = replay(raw, build_extractor(args.backend), conf_threshold=args.conf)
+        history, double = replay(raw, build_extractor(args.backend, getattr(args, "model", None)),
+                                 conf_threshold=args.conf)
         rules = len(double.index.semantic.rules)
         sub = "REAL captured log. "
     print()
@@ -247,6 +261,21 @@ def cmd_hook(args):
         return  # fail-open: never block the user's session
 
 
+def cmd_models(args):
+    """List local Ollama models the user can pick for the reasoning slot."""
+    from .backends import list_ollama_models
+    ms = list_ollama_models()
+    if not ms:
+        print("no local ollama models found.")
+        print("  is `ollama serve` running?  then e.g.:  ollama pull qwen2.5-coder:7b")
+        return
+    default = resolve_ollama_model(None)
+    print("local ollama models  (use:  codedouble report --backend ollama --model NAME)")
+    for m in ms:
+        print(f"  {'* ' if m == default else '  '}{m}")
+    print(f"\ndefault when no --model/CODEDOUBLE_OLLAMA_MODEL is set:  {default}")
+
+
 def cmd_status(args):
     raw = EventLog(args.log).read()
     hook = os.path.join(args.repo, ".git", "hooks", "post-commit")
@@ -280,6 +309,8 @@ def main(argv=None):
     p = sub.add_parser("report", help="replay the log -> ASCII + report.html")
     p.add_argument("--backend", default="real",
                    help="real (local ST embedder) | ollama (local LLM reasoning) | mistral | default")
+    p.add_argument("--model", default=None,
+                   help="ollama model for --backend ollama (overrides env; see `codedouble models`)")
     p.add_argument("--window", type=int, default=40)
     p.add_argument("--conf", type=float, default=0.6)
     p.add_argument("--out", default="report.html")
@@ -297,6 +328,9 @@ def main(argv=None):
 
     p = sub.add_parser("install-hook"); p.add_argument("--repo", default=".")
     p.set_defaults(func=lambda a: install_hook(a.repo))
+
+    p = sub.add_parser("models", help="list local ollama models you can pick for reasoning")
+    p.set_defaults(func=cmd_models)
 
     p = sub.add_parser("status"); p.add_argument("--repo", default=".")
     p.set_defaults(func=cmd_status)

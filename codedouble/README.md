@@ -79,14 +79,16 @@ unit-tested offline via `FakeLLM`.
 
 **Both slots local, no cloud (`ollama`).** Retrieval = sentence-transformers on
 CPU; reasoning = a local LLM via [Ollama](https://ollama.com) — no API key, fully
-offline once pulled. Pick the model with `CODEDOUBLE_OLLAMA_MODEL` (default
-`mistral`):
+offline once pulled. **You choose the model**; resolution order is
+`--model` flag → `CODEDOUBLE_OLLAMA_MODEL` env → first installed model → `mistral`,
+so with one model pulled it just works with no config.
 
 ```bash
-ollama pull mistral                                              # ~4 GB, snappy on CPU
-CODEDOUBLE_OLLAMA_MODEL=mistral codedouble report --backend ollama
-# or reuse a model you already have:
-CODEDOUBLE_OLLAMA_MODEL=BishengCMate:latest codedouble report --backend ollama
+codedouble models                                    # list local models, star the default
+ollama pull qwen2.5-coder:7b                          # ~4.7 GB, code-aware, fast on CPU
+codedouble report --backend ollama --model qwen2.5-coder:7b
+codedouble report --backend ollama                   # no --model: auto-picks an installed one
+CODEDOUBLE_OLLAMA_MODEL=BishengCMate:latest codedouble report --backend ollama   # or via env
 ```
 
 Reality check: a big model (e.g. a 30 GB one) needs RAM ≥ its size or it

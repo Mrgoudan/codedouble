@@ -210,9 +210,10 @@ class OllamaClient:
     """Local LLM via Ollama (no API key, no cloud). Talks to a running
     `ollama serve` at OLLAMA_HOST (default http://localhost:11434)."""
 
-    def __init__(self, model: str = "mistral", host: Optional[str] = None, timeout: float = 120.0):
+    def __init__(self, model: Optional[str] = None, host: Optional[str] = None, timeout: float = 120.0):
         self.host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
-        self.model = os.environ.get("CODEDOUBLE_OLLAMA_MODEL", model)
+        # explicit arg wins over env, env over the built-in default
+        self.model = model or os.environ.get("CODEDOUBLE_OLLAMA_MODEL") or "mistral"
         self.timeout = timeout
 
     def chat(self, prompt: str, system: Optional[str] = None, json_mode: bool = True) -> str:
@@ -231,7 +232,18 @@ class OllamaClient:
             return json.loads(resp.read().decode())["message"]["content"]
 
 
-def ollama_extractor(embedder: Embedder, model: str = "mistral") -> LLMExtractor:
+def list_ollama_models(host: Optional[str] = None) -> List[str]:
+    """Names of models a local `ollama serve` has pulled (empty if unreachable)."""
+    host = (host or os.environ.get("OLLAMA_HOST", "http://localhost:11434")).rstrip("/")
+    try:
+        with urllib.request.urlopen(host + "/api/tags", timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def ollama_extractor(embedder: Embedder, model: Optional[str] = None) -> LLMExtractor:
     """LLMExtractor whose reasoning runs on a LOCAL Ollama model; embeddings come
     from the given (local) embedder. Fully offline once the model is pulled."""
     client = OllamaClient(model=model)
