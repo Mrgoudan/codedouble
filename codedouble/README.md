@@ -114,6 +114,39 @@ is the make-or-break, surfacing immediately: git-subject signatures alone don't
 cluster. Richer capture (diffs, accept/reject, file-scoped overrides) is what
 would make them cluster — exactly what the next step has to test.
 
+## Gateway: route Claude Code through the double (intake + outtake)
+
+`codedouble hook` is a Claude Code hook adapter that makes the double a mandatory
+pass-through in both directions:
+
+- **UserPromptSubmit (intake)** → injects relevant precedent as context
+  ("you previously preferred X for this kind of request").
+- **PreToolUse (outtake)** → gates each Edit/Write/Bash via the 2×2: in **shadow**
+  it only *logs* the decision to `.codedouble/decisions.jsonl`; with
+  `CODEDOUBLE_ENFORCE=1` it returns **allow / ask** (`ask` surfaces the normal
+  permission prompt).
+
+It is **fail-open** (any error → no-op, never breaks your session) and **shadow by
+default** (never blocks until you opt in). `codedouble gate` is the same decision
+engine for manual/other transports.
+
+Wire it (global, shadow) — merges with your other hooks:
+```jsonc
+// ~/.claude/settings.json
+"hooks": {
+  "UserPromptSubmit": [{ "matcher": "", "hooks": [{ "type": "command", "command": "python3 -m codedouble.cli hook", "timeout": 30 }] }],
+  "PreToolUse":       [{ "matcher": "Edit|Write|Bash", "hooks": [{ "type": "command", "command": "python3 -m codedouble.cli hook", "timeout": 30 }] }]
+}
+```
+Restart Claude Code to load it. Watch: `cat .codedouble/decisions.jsonl` or `codedouble report`.
+
+- **Enforce** (block/ask for real) once shadow shows it's calibrated: change the
+  PreToolUse command to `CODEDOUBLE_ENFORCE=1 python3 -m codedouble.cli hook`.
+- **Cost / disable:** runs on every prompt + matched tool call (~0.3–0.5 s each).
+  Restore `~/.claude/settings.json.bak` or delete the codedouble entries to remove;
+  scope to one project by putting the same hooks in that project's
+  `.claude/settings.json`.
+
 ## The make-or-break is still open
 
 Swapping in real models does **not** close the real question — the simulated

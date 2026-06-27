@@ -18,7 +18,9 @@ import stat
 import sys
 
 import json
+import os
 import sys
+import time
 
 from .embedder import HashingEmbedder
 from .logger import (
@@ -114,13 +116,37 @@ def cmd_on(args):
     print("  python3 -m codedouble.cli report")
 
 
-def cmd_gate(args):
-    """The gateway decision: read an intent (JSON on stdin), emit a decision.
-    Fast (hashing embedder, no model load) so it can run in a per-call hook.
-    Used for BOTH directions: intake -> use `inject`; outtake -> use `allow`/`ask`."""
+def _decide(log_path, payload, conf):
+    """Run one gateway decision (fast: hashing embedder, no model load)."""
     from .double import Double
-    from .types import Action, Reversibility
+    from .types import Reversibility
+    raw = EventLog(log_path).read()
+    ext = RuleBasedExtractor(HashingEmbedder(256))
+    double = Double(ext, build_index(raw, ext), conf_threshold=conf)
+    double.now = float(len(raw) + 1)
+    rev = Reversibility.HIGH if payload.get("reversibility") == "high" else Reversibility.LOW
+    return double.resolve(moment_of(payload), rev)
 
+
+def _log_decision(log_path, event, tool, dec, enforce):
+    d = os.path.dirname(log_path) or "."
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "decisions.jsonl"), "a") as f:
+            f.write(json.dumps({
+                "ts": time.time(), "event": event, "tool": tool,
+                "action": dec.action.value, "ask": dec.action.value == "ask",
+                "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
+                "n": len(dec.retrieved), "enforce": enforce,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def cmd_gate(args):
+    """The gateway decision: read an intent (JSON on stdin), emit a decision JSON.
+    Used for BOTH directions: intake -> use `inject`; outtake -> use `allow`/`ask`."""
+    from .types import Action
     payload = {}
     try:
         if not sys.stdin.isatty():
@@ -131,31 +157,73 @@ def cmd_gate(args):
         payload = {}
     if args.request:
         payload.setdefault("request", args.request)
-
-    raw = EventLog(args.log).read()
-    ext = RuleBasedExtractor(HashingEmbedder(256))
-    double = Double(ext, build_index(raw, ext), conf_threshold=args.conf)
-    double.now = float(len(raw) + 1)
-    rev = Reversibility.HIGH if payload.get("reversibility") == "high" else Reversibility.LOW
-    dec = double.resolve(moment_of(payload), rev)
-
-    ask = dec.action is Action.ASK and not args.shadow
+    dec = _decide(args.log, payload, args.conf)
     inject = ""
     if dec.retrieved:
         inject = (f"[codedouble] precedent for this kind of change: '{dec.resolution}' "
                   f"(confidence {dec.confidence:.2f}, {len(dec.retrieved)} similar past decisions).")
-    out = {
+    print(json.dumps({
         "action": dec.action.value,
         "allow": (True if args.shadow else dec.action is not Action.ASK),
-        "ask": ask,
-        "resolution": dec.resolution,
-        "confidence": round(dec.confidence, 3),
-        "coverage": round(dec.coverage, 3),
-        "shadow": bool(args.shadow),
-        "inject": inject,
-        "rationale": dec.rationale,
-    }
-    print(json.dumps(out))
+        "ask": dec.action is Action.ASK and not args.shadow,
+        "resolution": dec.resolution, "confidence": round(dec.confidence, 3),
+        "coverage": round(dec.coverage, 3), "shadow": bool(args.shadow),
+        "inject": inject, "rationale": dec.rationale,
+    }))
+
+
+def cmd_hook(args):
+    """Claude Code hook adapter: read the hook event JSON on stdin, run the gate,
+    emit Claude Code's expected output. FAIL-OPEN (never breaks your session) and
+    SHADOW by default (no blocking) unless CODEDOUBLE_ENFORCE=1.
+
+    intake (UserPromptSubmit) -> inject precedent as additionalContext (always)
+    outtake (PreToolUse)      -> shadow: log only; enforce: allow / ask via 2x2
+    """
+    from .types import Action
+    try:
+        data = sys.stdin.read()
+        ev = json.loads(data) if data.strip() else {}
+    except Exception:
+        return  # fail-open
+    try:
+        name = ev.get("hook_event_name", "")
+        enforce = os.environ.get("CODEDOUBLE_ENFORCE") == "1"
+
+        if name == "UserPromptSubmit":
+            dec = _decide(args.log, {"request": ev.get("prompt", ""), "reversibility": "low"}, args.conf)
+            _log_decision(args.log, name, None, dec, enforce)
+            if dec.retrieved and dec.confidence >= 0.4:
+                ctx = (f"[codedouble] For this kind of request you've previously preferred "
+                       f"'{dec.resolution}' ({len(dec.retrieved)} similar past decisions, "
+                       f"confidence {dec.confidence:.2f}). Use it unless this case differs.")
+                print(json.dumps({"hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+            return
+
+        if name == "PreToolUse":
+            tool = ev.get("tool_name", "")
+            ti = ev.get("tool_input", {}) or {}
+            blob = (str(ti.get("command", "")) + " " + str(ti.get("file_path", ""))).lower()
+            rev = "high" if any(k in blob for k in (
+                "rm ", "rm -", "drop ", "delete", "truncate", "migrat", "schema",
+                "force", "reset --hard")) else "low"
+            payload = {
+                "request": f"{tool} {ti.get('file_path','')} {ti.get('command','')}".strip(),
+                "diff": str(ti.get("new_string", "") or ti.get("command", "")),
+                "files": [ti["file_path"]] if ti.get("file_path") else [],
+                "reversibility": rev,
+            }
+            dec = _decide(args.log, payload, args.conf)
+            _log_decision(args.log, name, tool, dec, enforce)
+            if enforce:
+                pd = "ask" if dec.action is Action.ASK else "allow"
+                print(json.dumps({"hookSpecificOutput": {
+                    "hookEventName": "PreToolUse", "permissionDecision": pd,
+                    "permissionDecisionReason": f"[codedouble] {dec.rationale}"}}))
+            return  # shadow: emit nothing -> normal flow
+    except Exception:
+        return  # fail-open: never block the user's session
 
 
 def cmd_status(args):
@@ -201,6 +269,9 @@ def main(argv=None):
     p.add_argument("--conf", type=float, default=0.6)
     p.add_argument("--shadow", action="store_true", help="never block; just log/emit the decision")
     p.set_defaults(func=cmd_gate)
+
+    p = sub.add_parser("hook", help="Claude Code hook adapter (reads hook JSON on stdin)")
+    p.add_argument("--conf", type=float, default=0.6); p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("install-hook"); p.add_argument("--repo", default=".")
     p.set_defaults(func=lambda a: install_hook(a.repo))

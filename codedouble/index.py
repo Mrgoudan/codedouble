@@ -112,8 +112,10 @@ class ResolutionIndex:
                 )
             elif level == 1:
                 ok = s.lang == sig.lang and s.phrasing_class == sig.phrasing_class
-            else:
+            elif level == 2:
                 ok = s.lang == sig.lang
+            else:
+                ok = True  # last resort: ignore metadata, rely on similarity
             if ok:
                 out.append(e)
         return out
@@ -127,14 +129,19 @@ class ResolutionIndex:
         min_coverage_events: int = 2,
     ) -> List[Tuple[ResolutionEvent, float]]:
         """Return [(event, similarity)] for similar in-scope precedent."""
+        qc = sig.code_vec
+        q_has_code = qc is not None and float(np.dot(qc, qc)) > 1e-9
         scored: List[Tuple[ResolutionEvent, float]] = []
-        for level in (0, 1, 2):
+        for level in (0, 1, 2, 3):
             candidates = self._filtered(sig, level)
             scored = []
             for e in candidates:
-                sim = CODE_W * cosine(sig.code_vec, e.signature.code_vec) + INTENT_W * cosine(
-                    sig.intent_vec, e.signature.intent_vec
-                )
+                ci = cosine(sig.intent_vec, e.signature.intent_vec)
+                ec = e.signature.code_vec
+                if q_has_code and ec is not None and float(np.dot(ec, ec)) > 1e-9:
+                    sim = CODE_W * cosine(qc, ec) + INTENT_W * ci  # both present
+                else:
+                    sim = ci  # no code on one side -> match on intent alone
                 if sim >= sim_threshold:
                     scored.append((e, sim))
             if len(scored) >= min_coverage_events:
