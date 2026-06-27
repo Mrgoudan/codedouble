@@ -168,6 +168,26 @@ def moment_of(rec: dict) -> dict:
     }
 
 
+def build_index(raw: List[dict], extractor):
+    """Load captured moments into a ResolutionIndex as endorsed precedent
+    (used by the live `gate` decision — no replay/scoring needed)."""
+    from .index import ResolutionIndex
+    from .types import Outcome, ResolutionEvent, Source, next_event_id
+    idx = ResolutionIndex()
+    for i, rec in enumerate(sorted(raw, key=lambda r: r.get("ts", 0))):
+        try:
+            oc = Outcome(rec.get("outcome", "accepted_silent"))
+        except ValueError:
+            oc = Outcome.ACCEPTED_SILENT
+        idx.add(ResolutionEvent(
+            id=next_event_id(), ts=float(i),
+            signature=extractor.extract(moment_of(rec)),
+            resolution=rec.get("resolution", ""), outcome=oc,
+            source=Source.HUMAN, confidence_at_decision=0.0,
+        ))
+    return idx
+
+
 def replay(raw: List[dict], extractor, conf_threshold: float = 0.6) -> Tuple[List[Record], Double]:
     """Counterfactual replay over captured moments in time order."""
     double = Double(extractor, conf_threshold=conf_threshold)

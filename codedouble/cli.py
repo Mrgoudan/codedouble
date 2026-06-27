@@ -17,8 +17,19 @@ import os
 import stat
 import sys
 
+import json
+import sys
+
 from .embedder import HashingEmbedder
-from .logger import DEFAULT_LOG, EventLog, capture_git, record_interaction, replay
+from .logger import (
+    DEFAULT_LOG,
+    EventLog,
+    build_index,
+    capture_git,
+    moment_of,
+    record_interaction,
+    replay,
+)
 from .signature import RuleBasedExtractor
 from .viz import ascii_report, render_html
 
@@ -103,6 +114,50 @@ def cmd_on(args):
     print("  python3 -m codedouble.cli report")
 
 
+def cmd_gate(args):
+    """The gateway decision: read an intent (JSON on stdin), emit a decision.
+    Fast (hashing embedder, no model load) so it can run in a per-call hook.
+    Used for BOTH directions: intake -> use `inject`; outtake -> use `allow`/`ask`."""
+    from .double import Double
+    from .types import Action, Reversibility
+
+    payload = {}
+    try:
+        if not sys.stdin.isatty():
+            data = sys.stdin.read().strip()
+            if data:
+                payload = json.loads(data)
+    except Exception:
+        payload = {}
+    if args.request:
+        payload.setdefault("request", args.request)
+
+    raw = EventLog(args.log).read()
+    ext = RuleBasedExtractor(HashingEmbedder(256))
+    double = Double(ext, build_index(raw, ext), conf_threshold=args.conf)
+    double.now = float(len(raw) + 1)
+    rev = Reversibility.HIGH if payload.get("reversibility") == "high" else Reversibility.LOW
+    dec = double.resolve(moment_of(payload), rev)
+
+    ask = dec.action is Action.ASK and not args.shadow
+    inject = ""
+    if dec.retrieved:
+        inject = (f"[codedouble] precedent for this kind of change: '{dec.resolution}' "
+                  f"(confidence {dec.confidence:.2f}, {len(dec.retrieved)} similar past decisions).")
+    out = {
+        "action": dec.action.value,
+        "allow": (True if args.shadow else dec.action is not Action.ASK),
+        "ask": ask,
+        "resolution": dec.resolution,
+        "confidence": round(dec.confidence, 3),
+        "coverage": round(dec.coverage, 3),
+        "shadow": bool(args.shadow),
+        "inject": inject,
+        "rationale": dec.rationale,
+    }
+    print(json.dumps(out))
+
+
 def cmd_status(args):
     raw = EventLog(args.log).read()
     hook = os.path.join(args.repo, ".git", "hooks", "post-commit")
@@ -140,6 +195,12 @@ def main(argv=None):
     p.add_argument("--out", default="report.html")
     p.add_argument("--sim", action="store_true", help="use the simulated user")
     p.add_argument("--seed", type=int, default=7); p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("gate", help="gateway decision for one intent (stdin JSON) -> decision JSON")
+    p.add_argument("--request", default="", help="intent text (or pipe JSON on stdin)")
+    p.add_argument("--conf", type=float, default=0.6)
+    p.add_argument("--shadow", action="store_true", help="never block; just log/emit the decision")
+    p.set_defaults(func=cmd_gate)
 
     p = sub.add_parser("install-hook"); p.add_argument("--repo", default=".")
     p.set_defaults(func=lambda a: install_hook(a.repo))
