@@ -1,4 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-  <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/>
-  <circle cx="12" cy="12" r="3"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M12 4C6 4 1.7 8.5 1 12c.7 3.5 5 8 11 8s10.3-4.5 11-8c-.7-3.5-5-8-11-8Zm0 3a5 5 0 100 10 5 5 0 000-10Zm0 2.6a2.4 2.4 0 100 4.8 2.4 2.4 0 000-4.8Z"/></svg>
