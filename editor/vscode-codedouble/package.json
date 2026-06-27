@@ -1,14 +1,24 @@
 {
   "name": "vscode-codedouble",
   "displayName": "CodeDouble Capture",
-  "description": "Faithfully records editor interactions (accept / override / reject / viewed) into .codedouble/interactions.jsonl for the Self-Learning Code Double.",
-  "version": "0.1.0",
+  "description": "Faithfully records editor interactions (accept / override / reject / viewed) into .codedouble/interactions.jsonl for the Self-Learning Code Double, with a live sidebar.",
+  "version": "0.1.1",
   "publisher": "codedouble",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
   "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "codedouble", "title": "CodeDouble", "icon": "media/eye.svg" }
+      ]
+    },
+    "views": {
+      "codedouble": [
+        { "id": "codedouble.view", "name": "Capture", "type": "webview" }
+      ]
+    },
     "commands": [
       { "command": "codedouble.acceptReviewed", "title": "CodeDouble: Accept selection (reviewed, wholesale)" },
       { "command": "codedouble.markOverride", "title": "CodeDouble: Mark selection as an override (I changed the AI's code)" },
@@ -23,7 +33,8 @@
         "codedouble.minInsertLines": { "type": "number", "default": 3, "description": "A single change inserting at least this many lines is treated as a proposal (likely AI/paste)." },
         "codedouble.minInsertChars": { "type": "number", "default": 80, "description": "...or at least this many characters in one change." },
         "codedouble.overrideWindowMs": { "type": "number", "default": 120000, "description": "If a proposal's region is edited within this window, it's an OVERRIDE." },
-        "codedouble.settleMs": { "type": "number", "default": 90000, "description": "A proposal not edited within this window is finalized as accepted." }
+        "codedouble.settleMs": { "type": "number", "default": 90000, "description": "A proposal not edited within this window is finalized as accepted." },
+        "codedouble.highlight": { "type": "boolean", "default": true, "description": "Briefly highlight the affected lines when an interaction is captured." }
       }
     }
   },
