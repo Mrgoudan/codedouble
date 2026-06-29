@@ -326,18 +326,43 @@ class OpenAICompatLLM:
         raise last or RuntimeError("LLM port: all keys failed")
 
 
-def llm_complete(prompt, system=None, json_mode=False, timeout=90.0) -> str:
-    """LLM-FIRST, local-fallback dispatcher for the semantic 'hunting' tasks. Tries
-    the configured LLM port (with key rotation); else a local Ollama model; else
-    raises (callers then fall back to their cheap heuristic)."""
+def llm_complete(prompt, system=None, json_mode=False, timeout=90.0, prefer="local") -> str:
+    """SMART DISPATCH between the remote port and local Ollama:
+      prefer='remote' -> HARD, session-wide tasks (anchor consolidation): the big
+                         remote model (e.g. GLM-5.2) first, local as fallback.
+      prefer='local'  -> frequent / easier tasks (per-edit checks): local Ollama
+                         first, the remote port as fallback.
+    Each tier falls through to the other; if neither is reachable it raises, and the
+    caller drops to its cheap heuristic. Reserves the rate-limited remote keys for
+    the work that actually needs them."""
     base, keys, model = _llm_config()
-    if base:
+    ol = list_ollama_models()
+
+    def _port():
         return OpenAICompatLLM(base, keys, model).chat(prompt, system, json_mode, timeout)
-    models = list_ollama_models()
-    if models:
-        m = os.environ.get("CODEDOUBLE_OLLAMA_MODEL") or models[0]
+
+    def _ollama():
+        m = os.environ.get("CODEDOUBLE_OLLAMA_MODEL") or ol[0]
         return OllamaClient(model=m, timeout=timeout).chat(prompt, system, json_mode)
-    raise RuntimeError("no LLM endpoint available (set CODEDOUBLE_LLM_BASE_URL / ~/.codedouble/llm.json, or run ollama)")
+
+    order = []
+    if prefer == "remote":
+        if base:
+            order.append(_port)
+        if ol:
+            order.append(_ollama)
+    else:
+        if ol:
+            order.append(_ollama)
+        if base:
+            order.append(_port)
+    last = None
+    for fn in order:
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("no LLM endpoint available (set CODEDOUBLE_LLM_BASE_URL / ~/.codedouble/llm.json, or run ollama)")
 
 
 def ollama_extractor(embedder: Embedder, model: Optional[str] = None) -> LLMExtractor:

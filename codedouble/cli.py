@@ -259,9 +259,9 @@ def _quality_check(intent, proposed):
     """Ask the LOCAL model whether the change meets the intent. Returns
     (ok, refine). Fail-open: any error -> ok=True (never block on QC failure)."""
     try:
-        from .backends import llm_complete                       # LLM-first (port -> ollama)
+        from .backends import llm_complete                       # frequent / per-edit -> local first
         out = llm_complete(f"Intent:\n{intent}\n\nProposed change:\n{proposed[:2000]}",
-                           system=_QC_SYSTEM, json_mode=True, timeout=40)
+                           system=_QC_SYSTEM, json_mode=True, timeout=40, prefer="local")
         data = json.loads(out)
         return bool(data.get("ok", True)), str(data.get("refine", ""))[:200]
     except Exception:
@@ -454,8 +454,8 @@ def _consolidate(notes):
     a minimal extractive anchor set otherwise."""
     text = "\n".join(f"- {n}" for n in notes[-50:])
     try:
-        from .backends import llm_complete                       # LLM-first (port -> ollama)
-        out = llm_complete(text, system=_ANCHORS_SYSTEM, json_mode=True, timeout=90)
+        from .backends import llm_complete                       # HARD, session-wide -> remote (GLM)
+        out = llm_complete(text, system=_ANCHORS_SYSTEM, json_mode=True, timeout=90, prefer="remote")
         json.loads(out)                       # validate
         return out
     except Exception:
