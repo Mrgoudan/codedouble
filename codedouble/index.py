@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -32,8 +33,42 @@ from .types import (
 # tuning knobs (prototype defaults)
 RECENCY_HALFLIFE = 50.0   # ts units after which an event's weight halves
 COVERAGE_TAU = 3.0        # weight at which coverage-factor ~ 0.63 (saturates)
-SIM_THRESHOLD = 0.45      # min combined cosine to count as "similar"
+SIM_THRESHOLD = 0.45      # min combined score to count as "similar"
 CODE_W, INTENT_W = 0.5, 0.5
+SEM_W, LEX_W = 0.5, 0.5    # hybrid: semantic (vectors) + lexical (identifier overlap)
+K_MIN, K_MAX = 5, 20       # determinacy-adaptive retrieval scope
+
+
+def _sig_tokens(sig: Signature) -> set:
+    """Lexical view of a signature: identifiers/keywords from request, symbols,
+    file names, error/phrasing, and a slice of the diff. snake_case and camelCase
+    are split so 'flag_skip_reason' / 'flagSkipReason' match 'skip'."""
+    parts = [
+        sig.raw_request or "",
+        " ".join(sig.symbols or ()),
+        " ".join(f.rsplit("/", 1)[-1] for f in (sig.files or ())),
+        sig.error_type or "", sig.phrasing_class or "", sig.action_kind or "",
+        (sig.raw_diff or "")[:600],
+    ]
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", " ".join(parts))   # split camelCase
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 2}
+
+
+def _determinacy(sig: Signature) -> float:
+    """How *determined* the intent is (0=vague, 1=precise). Drives scope:
+    vague -> gather more & loosen; precise -> stay tight."""
+    d = 0.25
+    if sig.error_type:
+        d += 0.30
+    if sig.symbols:
+        d += 0.20
+    if sig.files:
+        d += 0.10
+    if sig.phrasing_class in ("fix-it", "make-like-X", "remove", "add-feature"):
+        d += 0.15
+    if len(_sig_tokens(sig)) >= 6:
+        d += 0.10
+    return max(0.0, min(1.0, d))
 
 
 class SemanticStore:
@@ -122,34 +157,65 @@ class ResolutionIndex:
                 out.append(e)
         return out
 
+    def _event_tokens(self, e: ResolutionEvent) -> set:
+        cache = getattr(e, "_lextok", None)
+        if cache is None:
+            cache = _sig_tokens(e.signature)
+            try:
+                e._lextok = cache       # memoise on the event (no __slots__)
+            except Exception:
+                pass
+        return cache
+
+    def _idf(self) -> Dict[str, float]:
+        """Inverse doc frequency over events — rare identifiers weigh more."""
+        n = max(1, len(self.events))
+        df: Dict[str, int] = defaultdict(int)
+        for e in self.events:
+            for t in self._event_tokens(e):
+                df[t] += 1
+        return {t: math.log(1.0 + n / c) for t, c in df.items()}
+
     def retrieve(
         self,
         sig: Signature,
         now: float,
-        k: int = 12,
+        k: Optional[int] = None,
         sim_threshold: float = SIM_THRESHOLD,
         min_coverage_events: int = 2,
     ) -> List[Tuple[ResolutionEvent, float]]:
-        """Return [(event, similarity)] for similar in-scope precedent."""
+        """Intent-aware HYBRID retrieval (README §6): blend semantic vectors with
+        lexical identifier overlap (idf-weighted), and size the scope to how
+        *determined* the intent is — vague intents gather more and loosen the bar,
+        precise intents stay tight."""
+        d = _determinacy(sig)
+        k_dyn = k if k is not None else int(round(K_MIN + (1.0 - d) * (K_MAX - K_MIN)))
+        thr = max(0.15, sim_threshold - (1.0 - d) * 0.12)     # loosen for vague intents
+        qtok = _sig_tokens(sig)
+        idf = self._idf()
+        qsum = sum(idf.get(t, 0.0) for t in qtok) or 1.0
         qc = sig.code_vec
         q_has_code = qc is not None and float(np.dot(qc, qc)) > 1e-9
         scored: List[Tuple[ResolutionEvent, float]] = []
         for level in (0, 1, 2, 3):
-            candidates = self._filtered(sig, level)
             scored = []
-            for e in candidates:
+            for e in self._filtered(sig, level):
                 ci = cosine(sig.intent_vec, e.signature.intent_vec)
                 ec = e.signature.code_vec
                 if q_has_code and ec is not None and float(np.dot(ec, ec)) > 1e-9:
-                    sim = CODE_W * cosine(qc, ec) + INTENT_W * ci  # both present
+                    sem = CODE_W * cosine(qc, ec) + INTENT_W * ci
                 else:
-                    sim = ci  # no code on one side -> match on intent alone
-                if sim >= sim_threshold:
-                    scored.append((e, sim))
+                    sem = ci
+                sem = max(0.0, min(1.0, sem))
+                etok = self._event_tokens(e)
+                lex = (sum(idf.get(t, 0.0) for t in (qtok & etok)) / qsum) if qtok else 0.0
+                score = SEM_W * sem + LEX_W * lex            # hybrid
+                if score >= thr:
+                    scored.append((e, score))
             if len(scored) >= min_coverage_events:
-                break  # enough at this altitude; stop backing off
+                break       # enough at this altitude; stop backing off
         scored.sort(key=lambda t: t[1], reverse=True)
-        return scored[:k]
+        return scored[:k_dyn]
 
     # ---- confidence from evidence (README §8) ----
     def confidence(
