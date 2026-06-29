@@ -1,7 +1,8 @@
 // CodeDouble Capture — records editor interactions (accept / override / reject /
 // viewed) into the GLOBAL ~/.codedouble/interactions.jsonl (same schema + path the
-// Python CLI defaults to), so the double learns across ALL VS Code windows / repos,
-// with a live panel and a brief highlight so you can SEE it work.
+// Python CLI defaults to), so the double learns across ALL VS Code windows / repos.
+// The "CodeDouble" panel (in the Explorer) shows live, all-repo stats so you can
+// SEE it work; analysis/visualization is in Python:  codedouble report
 //
 // Capture in the editor; analysis/visualization in Python:
 //   python3 -m codedouble.cli report   (or: codedouble report)
@@ -22,8 +23,6 @@ interface Proposal {
 
 const pending = new Map<string, Proposal[]>();
 let sessionCount = 0;
-const recent: Array<{ outcome: string; file: string }> = [];
-const tally: Record<string, number> = {};
 let statusBar: vscode.StatusBarItem;
 let view: CodeDoubleView | undefined;
 let flashDeco: vscode.TextEditorDecorationType;
@@ -52,9 +51,25 @@ const LANG: Record<string, string> = {
   cpp: "cpp", ruby: "ruby", php: "php", csharp: "csharp",
 };
 
+const OUTCOME_COLOR: Record<string, string> = {
+  override: "#f85149", revert: "#f85149", interrupt: "#f85149",
+  confirmed_good: "#3fb950", answered: "#3fb950",
+  accepted_silent: "#8b949e", never_viewed: "#6e7681", pending: "#d29922",
+};
+const NEG = new Set(["override", "revert", "interrupt"]);
+
 function firstLine(text: string): string {
   for (const ln of text.split("\n")) { const t = ln.trim(); if (t) return t.slice(0, 80); }
   return text.trim().slice(0, 80);
+}
+
+function relTime(tsSec: number): string {
+  const s = Math.max(0, Date.now() / 1000 - tsSec);
+  if (!tsSec) return "";
+  if (s < 60) return `${Math.floor(s)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86400)}d`;
 }
 
 function reversibilityOf(doc: vscode.TextDocument, actionKind: string): string {
@@ -97,19 +112,67 @@ function record(
     return;
   }
   sessionCount++;
-  tally[outcome] = (tally[outcome] ?? 0) + 1;
-  recent.unshift({ outcome, file: rel });
-  if (recent.length > 15) recent.pop();
   updateStatus();
   view?.refresh();
   if (flashRange) flash(doc, flashRange.start, flashRange.end);
+}
+
+// ---- read all-repo stats from the global log (the panel's data) -------------
+interface Stats {
+  total: number;
+  repos: number;
+  overrideRate: number;             // % of decisions you overrode/reverted/interrupted
+  outcomes: Array<{ k: string; v: number; color: string; pct: number }>;
+  recent: Array<{ outcome: string; file: string; rel: string; neg: boolean; pos: boolean }>;
+}
+
+function readStats(): Stats {
+  const lp = logPath();
+  const counts: Record<string, number> = {};
+  const repos = new Set<string>();
+  const recent: Stats["recent"] = [];
+  let total = 0;
+  try {
+    const lines = fs.readFileSync(lp, "utf8").split("\n");
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      total++;
+      try {
+        const r = JSON.parse(line);
+        counts[r.outcome] = (counts[r.outcome] || 0) + 1;
+        if (r.repo) repos.add(r.repo);
+      } catch { /* skip malformed */ }
+    }
+    const tail = lines.filter((l) => l.trim()).slice(-12).reverse();
+    for (const line of tail) {
+      try {
+        const r = JSON.parse(line);
+        const f = (r.files && r.files[0]) || r.request || "";
+        recent.push({
+          outcome: r.outcome || "?", file: String(f).split("/").pop() || String(f),
+          rel: relTime(r.ts || 0), neg: NEG.has(r.outcome),
+          pos: r.outcome === "confirmed_good" || r.outcome === "answered",
+        });
+      } catch { /* skip */ }
+    }
+  } catch { /* no log yet */ }
+  const neg = Object.entries(counts).filter(([k]) => NEG.has(k)).reduce((a, [, v]) => a + v, 0);
+  const max = Math.max(1, ...Object.values(counts));
+  const outcomes = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => ({ k, v, color: OUTCOME_COLOR[k] || "#8b949e", pct: Math.round((100 * v) / max) }));
+  return {
+    total, repos: repos.size,
+    overrideRate: total ? Math.round((100 * neg) / total) : 0,
+    outcomes, recent,
+  };
 }
 
 function updateStatus(): void {
   if (!statusBar) return;
   const on = cfg<boolean>("enabled", true);
   statusBar.text = `$(eye) CodeDouble ${on ? sessionCount : "off"}`;
-  statusBar.tooltip = "Interactions captured this session — click to open the panel";
+  statusBar.tooltip = "CodeDouble — interactions captured this session. Click to open the panel.";
   statusBar.show();
 }
 
@@ -176,59 +239,127 @@ function selectionText(): { doc: vscode.TextDocument; text: string; range: { sta
   return { doc: ed.document, text, range: { start: sel.start.line, end: sel.end.line } };
 }
 
-// ----------------------------- sidebar -------------------------------------
+// ----------------------------- panel ---------------------------------------
 class CodeDoubleView implements vscode.WebviewViewProvider {
   private wv?: vscode.WebviewView;
+  private timer?: NodeJS.Timeout;
+
   resolveWebviewView(v: vscode.WebviewView): void {
     this.wv = v;
     v.webview.options = { enableScripts: true };
     v.webview.html = this.html();
     v.webview.onDidReceiveMessage((m) => {
-      if (m?.cmd === "openReport") vscode.commands.executeCommand("codedouble.openReport");
-      if (m?.cmd === "toggle") vscode.commands.executeCommand("codedouble.toggle");
+      const map: Record<string, string> = {
+        openReport: "codedouble.openReport", toggle: "codedouble.toggle",
+        accept: "codedouble.acceptReviewed", override: "codedouble.markOverride",
+        reject: "codedouble.reject",
+      };
+      if (m?.cmd && map[m.cmd]) vscode.commands.executeCommand(map[m.cmd]);
     });
+    v.onDidChangeVisibility(() => { if (v.visible) this.refresh(); });
     this.refresh();
+    if (this.timer) clearInterval(this.timer);
+    this.timer = setInterval(() => { if (this.wv?.visible) this.refresh(); }, 15000);
   }
+
   refresh(): void {
-    this.wv?.webview.postMessage({
-      enabled: cfg<boolean>("enabled", true), count: sessionCount, tally, recent,
+    if (!this.wv) return;
+    this.wv.webview.postMessage({
+      enabled: cfg<boolean>("enabled", true),
+      session: sessionCount,
+      ...readStats(),
     });
   }
+
+  dispose(): void { if (this.timer) clearInterval(this.timer); }
+
   private html(): string {
     return `<!doctype html><html><head><meta charset="utf-8"><style>
-      body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:8px 10px}
-      .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-      .on{background:#5cb85c}.off{background:#888}
-      h4{margin:10px 0 4px;font-size:11px;text-transform:uppercase;opacity:.7;letter-spacing:.04em}
-      .chip{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;margin:2px 4px 2px 0;color:#fff}
-      ul{list-style:none;padding:0;margin:0;font-size:12px}
-      li{padding:2px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      .neg{color:#d9534f}.pos{color:#5cb85c}.weak{opacity:.6}
-      button{margin-top:10px;width:100%;padding:5px;cursor:pointer;
-        background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:3px}
-      .muted{opacity:.6;font-size:11px;margin-top:6px}
+      :root{color-scheme:light dark}
+      body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:10px 12px;font-size:12px}
+      .row{display:flex;align-items:center;gap:6px}
+      .dot{width:9px;height:9px;border-radius:50%;cursor:pointer}
+      .on{background:#3fb950}.off{background:#8b949e}
+      .grow{flex:1}
+      .sub{opacity:.6;font-size:11px}
+      .big{font-size:28px;font-weight:600;line-height:1.1;margin-top:6px}
+      h4{margin:14px 0 5px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;opacity:.55}
+      .metric{font-size:22px;font-weight:600}
+      .bar{height:6px;border-radius:4px;background:var(--vscode-input-background,#2228);overflow:hidden;margin:2px 0 6px}
+      .bar>i{display:block;height:100%}
+      .obrow{display:flex;align-items:center;gap:8px;font-size:11px;margin-top:6px}
+      .obrow .lbl{width:104px}.obrow .n{width:28px;text-align:right;opacity:.8}
+      .obrow .track{flex:1}
+      ul{list-style:none;padding:0;margin:0}
+      li{display:flex;gap:8px;padding:2px 0;font-size:11px;white-space:nowrap;overflow:hidden}
+      li .f{flex:1;overflow:hidden;text-overflow:ellipsis}
+      li .t{opacity:.5}
+      .neg{color:#f85149}.pos{color:#3fb950}.weak{opacity:.6}
+      button{width:100%;padding:6px;cursor:pointer;border:none;border-radius:4px;
+        background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-top:10px;font-size:12px}
+      .acts{display:flex;gap:6px;margin-top:8px}
+      .acts button{margin-top:0;padding:5px 0;font-size:11px;background:var(--vscode-button-secondaryBackground,#3a3d41);color:var(--vscode-button-secondaryForeground,#fff)}
+      .muted{opacity:.5;font-size:10px;margin-top:12px;word-break:break-all}
+      .empty{opacity:.6;font-size:11px;margin-top:6px;line-height:1.5}
     </style></head><body>
-      <div><span id="dot" class="dot off"></span><b id="state">…</b></div>
-      <div id="count" style="font-size:22px;margin:6px 0 2px">0</div>
-      <div class="muted">interactions captured this session</div>
-      <h4>Outcomes</h4><div id="tally"></div>
-      <h4>Recent</h4><ul id="recent"></ul>
+      <div class="row"><span id="dot" class="dot off" title="toggle capture"></span>
+        <b id="state">…</b><span class="grow"></span><span class="sub" id="sess"></span></div>
+
+      <div class="big" id="total">0</div>
+      <div class="sub" id="totalsub">interactions captured</div>
+
+      <div id="content" style="display:none">
+        <h4>Override rate</h4>
+        <div class="metric" id="orate">0%</div>
+        <div class="sub">overrides + reverts ÷ total — the number the double should drive down as it learns you</div>
+
+        <h4>Outcomes</h4><div id="outcomes"></div>
+
+        <h4>Recent</h4><ul id="recent"></ul>
+      </div>
+
+      <div id="empty" class="empty">
+        No interactions yet.<br>Paste or accept a 3+ line block in any file — it'll show up here,
+        and the affected lines flash briefly. Or run <code>codedouble on</code> in a repo to mine its git history.
+      </div>
+
       <button id="report">Open report ▸</button>
-      <div class="muted">Global store: ~/.codedouble/interactions.jsonl (all windows)</div>
+      <div class="acts">
+        <button id="accept" title="Mark selection as reviewed & accepted">✓ accept</button>
+        <button id="override" title="Mark selection as an override">✎ override</button>
+        <button id="reject" title="Mark selection as rejected">✗ reject</button>
+      </div>
+      <div class="muted" id="store"></div>
+
       <script>
-        const COLORS={override:'#d9534f',revert:'#d9534f',interrupt:'#d9534f',
-          confirmed_good:'#5cb85c',answered:'#5cb85c',accepted_silent:'#888',never_viewed:'#bbb'};
-        const NEG=new Set(['override','revert','interrupt']);
         const vscode=acquireVsCodeApi();
-        document.getElementById('report').onclick=()=>vscode.postMessage({cmd:'openReport'});
-        document.getElementById('dot').onclick=()=>vscode.postMessage({cmd:'toggle'});
+        const $=id=>document.getElementById(id);
+        const send=cmd=>vscode.postMessage({cmd});
+        $('report').onclick=()=>send('openReport');
+        $('dot').onclick=()=>send('toggle');
+        $('accept').onclick=()=>send('accept');
+        $('override').onclick=()=>send('override');
+        $('reject').onclick=()=>send('reject');
         addEventListener('message',e=>{const s=e.data;
-          document.getElementById('dot').className='dot '+(s.enabled?'on':'off');
-          document.getElementById('state').textContent=s.enabled?'capturing':'paused';
-          document.getElementById('count').textContent=s.count;
-          document.getElementById('tally').innerHTML=Object.keys(s.tally).length?
-            Object.entries(s.tally).map(([k,v])=>'<span class="chip" style="background:'+(COLORS[k]||'#888')+'">'+k+' '+v+'</span>').join(''):'<span class="muted">none yet — paste 3+ lines to test</span>';
-          document.getElementById('recent').innerHTML=s.recent.map(r=>'<li class="'+(NEG.has(r.outcome)?'neg':(r.outcome.startsWith('confirmed')||r.outcome==='answered'?'pos':'weak'))+'">'+r.outcome+' · '+r.file+'</li>').join('');
+          $('dot').className='dot '+(s.enabled?'on':'off');
+          $('state').textContent=s.enabled?'capturing':'paused';
+          $('sess').textContent=(s.session||0)+' this session';
+          $('total').textContent=s.total||0;
+          $('totalsub').textContent='interactions captured'+(s.repos>1?(' · '+s.repos+' repos'):'');
+          const has=(s.total||0)>0;
+          $('content').style.display=has?'block':'none';
+          $('empty').style.display=has?'none':'block';
+          $('orate').textContent=(s.overrideRate||0)+'%';
+          $('orate').className='metric '+((s.overrideRate||0)>25?'neg':(s.overrideRate<=10?'pos':''));
+          $('outcomes').innerHTML=(s.outcomes||[]).map(o=>
+            '<div class="obrow"><span class="lbl">'+o.k+'</span>'+
+            '<span class="track"><span class="bar"><i style="width:'+o.pct+'%;background:'+o.color+'"></i></span></span>'+
+            '<span class="n">'+o.v+'</span></div>').join('');
+          $('recent').innerHTML=(s.recent||[]).map(r=>
+            '<li class="'+(r.neg?'neg':(r.pos?'pos':'weak'))+'">'+
+            '<span class="f">'+r.outcome+' · '+(r.file||'')+'</span><span class="t">'+(r.rel||'')+'</span></li>').join('')
+            || '<li class="weak">—</li>';
+          $('store').textContent=s.store||'';
         });
       </script></body></html>`;
   }
@@ -242,12 +373,12 @@ export function activate(context: vscode.ExtensionContext): void {
     overviewRulerLane: vscode.OverviewRulerLane.Center,
   });
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBar.command = "codedouble.openReport";
+  statusBar.command = "workbench.view.explorer";
   updateStatus();
   view = new CodeDoubleView();
 
   context.subscriptions.push(
-    flashDeco, statusBar,
+    flashDeco, statusBar, { dispose: () => view?.dispose() },
     vscode.window.registerWebviewViewProvider("cdCaptureView", view),
     vscode.workspace.onDidChangeTextDocument(onChange),
     vscode.window.onDidChangeTextEditorVisibleRanges(onVisible),
@@ -276,13 +407,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("codedouble.toggle", async () => {
       const conf = vscode.workspace.getConfiguration("codedouble");
       const next = !conf.get<boolean>("enabled", true);
-      await conf.update("enabled", next, vscode.ConfigurationTarget.Workspace);
+      await conf.update("enabled", next, vscode.ConfigurationTarget.Global);
       updateStatus(); view?.refresh();
-      vscode.window.showInformationMessage(`CodeDouble capture ${next ? "ON" : "OFF"}`);
+      vscode.window.setStatusBarMessage(`CodeDouble capture ${next ? "ON" : "OFF"}`, 2500);
     })
   );
 }
 
 export function deactivate(): void {
+  view?.dispose();
   for (const arr of pending.values()) for (const p of arr) if (p.timer) clearTimeout(p.timer);
 }
