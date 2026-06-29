@@ -382,6 +382,84 @@ def _capture_reply(log_path, tool, target, ran):
         pass
 
 
+# ---- incremental per-session summary; the gate checks AI actions against it ----
+def _session_dir(log_path):
+    d = os.path.join(os.path.dirname(log_path) or ".", "sessions")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _sid_file(log_path, sid, ext):
+    return os.path.join(_session_dir(log_path), f"{(sid or 'default')[:64]}{ext}")
+
+
+def _session_note(log_path, sid, prompt):
+    """Incrementally append the user's intent to this session's running notes."""
+    try:
+        with open(_sid_file(log_path, sid, ".jsonl"), "a") as f:
+            f.write(json.dumps({"ts": time.time(), "prompt": (prompt or "")[:500]}) + "\n")
+    except Exception:
+        pass
+
+
+def _session_summary(log_path, sid):
+    """The session's established intent — the consolidated summary if present, else
+    the recent running notes (so the check works even before consolidation)."""
+    try:
+        sp = _sid_file(log_path, sid, ".summary.txt")
+        if os.path.exists(sp):
+            return open(sp).read()[:1600]
+    except Exception:
+        pass
+    try:
+        lines = open(_sid_file(log_path, sid, ".jsonl")).readlines()[-12:]
+        return "\n".join("- " + json.loads(l).get("prompt", "")[:160] for l in lines)[:1600]
+    except Exception:
+        return ""
+
+
+_SUMMARY_SYSTEM = (
+    "Consolidate these developer prompts from one coding session into a compact, "
+    "durable summary of INTENT: what they want, key decisions, constraints, "
+    "preferences, and corrections. 4-7 short bullets, no preamble."
+)
+
+
+def _consolidate(notes):
+    text = "\n".join(f"- {n}" for n in notes[-40:])
+    try:
+        from .backends import OllamaClient
+        return OllamaClient(model=resolve_ollama_model(None), timeout=60).chat(
+            text, system=_SUMMARY_SYSTEM, json_mode=False)[:1600]
+    except Exception:
+        return text[:1600]      # fail-open: extractive (the notes themselves)
+
+
+def cmd_summarize(args):
+    """Consolidate each session's running notes into a compact intent summary
+    (local LLM if available; extractive fallback). Run on idle. Idempotent."""
+    import glob
+    n = 0
+    for notes_path in glob.glob(os.path.join(_session_dir(args.log), "*.jsonl")):
+        try:
+            notes = [json.loads(l).get("prompt", "") for l in open(notes_path) if l.strip()]
+        except Exception:
+            continue
+        if not notes:
+            continue
+        try:
+            with open(notes_path[:-6] + ".summary.txt", "w") as f:
+                f.write(_consolidate(notes))
+            n += 1
+        except Exception:
+            pass
+    if not args.quiet:
+        print(f"summarized {n} session(s)")
+
+
 def cmd_gate(args):
     """The gateway decision: read an intent (JSON on stdin), emit a decision JSON.
     Used for BOTH directions: intake -> use `inject`; outtake -> use `allow`/`ask`."""
@@ -432,6 +510,7 @@ def cmd_hook(args):
         if name == "UserPromptSubmit":
             prompt = ev.get("prompt", "")
             _capture_correction(args.log, prompt, ev.get("transcript_path"))   # learn from "no, I meant X"
+            _session_note(args.log, ev.get("session_id", ""), prompt)          # incremental session summary
             dec = _decide(args.log, {"request": prompt, "reversibility": "low"}, args.conf)
             injected = bool(dec.retrieved and dec.confidence >= 0.4 and dec.resolution)
             _log_decision(args.log, name, None, dec, enforce, intent=prompt,
@@ -485,7 +564,10 @@ def cmd_hook(args):
                     and os.environ.get("CODEDOUBLE_QC") == "1"):
                 proposed = str(ti.get("new_string") or ti.get("content") or "")
                 if proposed.strip():
-                    ok, refine = _quality_check(_last_prompt(args.log) or payload["request"], proposed)
+                    # check against the SESSION SUMMARY (established intent), not just the last prompt
+                    intent_ref = (_session_summary(args.log, ev.get("session_id", ""))
+                                  or _last_prompt(args.log) or payload["request"])
+                    ok, refine = _quality_check(intent_ref, proposed)
                     if not ok:
                         verdict = "deny"
                         after = refine or "Redo it to match what was asked, more carefully."
@@ -615,6 +697,9 @@ def main(argv=None):
                    help="age(s) after which it's 'confirmed good' (default 1d)")
     p.add_argument("--min-promote", dest="min_promote", type=int, default=3)
     p.add_argument("--quiet", action="store_true"); p.set_defaults(func=cmd_reflect)
+
+    p = sub.add_parser("summarize", help="consolidate each session's running notes into an intent summary (run on idle)")
+    p.add_argument("--quiet", action="store_true"); p.set_defaults(func=cmd_summarize)
 
     p = sub.add_parser("models", help="list local ollama models you can pick for reasoning")
     p.set_defaults(func=cmd_models)

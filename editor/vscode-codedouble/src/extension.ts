@@ -539,7 +539,8 @@ export function activate(context: vscode.ExtensionContext): void {
     if (Date.now() - lastActivity < 5 * 60 * 1000) return;   // still active
     if (lastActivity <= lastReflect) return;                 // nothing new since last reflect
     lastReflect = Date.now();
-    cp.exec("python3 -m codedouble.cli reflect --quiet", { timeout: 60000 }, () => view?.refresh());
+    cp.exec("python3 -m codedouble.cli reflect --quiet; python3 -m codedouble.cli summarize --quiet",
+      { timeout: 90000 }, () => view?.refresh());
   }, 60 * 1000);
   context.subscriptions.push({ dispose: () => clearInterval(idleTimer) });
 }
