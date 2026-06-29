@@ -24,6 +24,18 @@ const pending = new Map<string, Proposal[]>();
 let sessionCount = 0;
 let lastActivity = Date.now();
 let lastReflect = 0;
+const MATTERS = new Set(["override", "revert", "interrupt"]);   // high-signal moments
+let sinceReflect = 0;
+
+// Reflect/summarize when something that MATTERS happens, or every N interactions —
+// event-driven, not on an idle clock. Coalesced so bursts don't thrash.
+function maybeReflect(): void {
+  const now = Date.now();
+  if (now - lastReflect < 15000) return;
+  lastReflect = now; sinceReflect = 0;
+  cp.exec("python3 -m codedouble.cli reflect --quiet; python3 -m codedouble.cli summarize --quiet",
+    { timeout: 90000 }, () => view?.refresh());
+}
 let statusBar: vscode.StatusBarItem;
 let view: CodeDoubleView | undefined;
 let flashDeco: vscode.TextEditorDecorationType;
@@ -125,7 +137,9 @@ function record(
     return;
   }
   sessionCount++;
+  sinceReflect++;
   lastActivity = Date.now();
+  if (MATTERS.has(outcome) || sinceReflect >= 15) maybeReflect();   // when it matters / every N
   updateStatus();
   view?.refresh();
   if (flashRange) flash(doc, flashRange.start, flashRange.end);
@@ -531,18 +545,6 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  // Layered reflection, OFF the hot path: after ~5 min of no captures, run the
-  // survival-time reflection (tiers mostly-good/confirmed by how long changes
-  // survived, distils rules). Idempotent, so re-running just generalises more.
-  const idleTimer = setInterval(() => {
-    if (!cfg<boolean>("enabled", true)) return;
-    if (Date.now() - lastActivity < 5 * 60 * 1000) return;   // still active
-    if (lastActivity <= lastReflect) return;                 // nothing new since last reflect
-    lastReflect = Date.now();
-    cp.exec("python3 -m codedouble.cli reflect --quiet; python3 -m codedouble.cli summarize --quiet",
-      { timeout: 90000 }, () => view?.refresh());
-  }, 60 * 1000);
-  context.subscriptions.push({ dispose: () => clearInterval(idleTimer) });
 }
 
 export function deactivate(): void {

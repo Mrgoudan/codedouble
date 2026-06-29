@@ -271,6 +271,37 @@ def _quality_check(intent, proposed):
         return True, ""
 
 
+def _maybe_reflect(log_path, summarize=False):
+    """Trigger reflection when something that MATTERS happens (a correction, a
+    send-back, an override) — rate-limited (coalesce bursts) and DETACHED so the hook
+    returns immediately. Event-driven, not idle/clock-driven."""
+    d = os.path.dirname(log_path) or "."
+    marker = os.path.join(d, ".last_reflect")
+    now = time.time()
+    try:
+        last = float(open(marker).read().strip())
+    except Exception:
+        last = 0.0
+    if now - last < 20:                      # coalesce bursts
+        return
+    try:
+        with open(marker, "w") as f:
+            f.write(str(now))
+    except Exception:
+        pass
+    import subprocess
+    base = [sys.executable, "-m", "codedouble.cli"]
+    cmds = [base + ["reflect", "--quiet"]]
+    if summarize:
+        cmds.append(base + ["summarize", "--quiet"])
+    for argv in cmds:
+        try:
+            subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
+
+
 # the conversational signal we were missing: you correcting the AI's UNDERSTANDING
 _CORRECTION_RE = re.compile(
     r"(^\s*(no\b|nope\b|actually\b|wrong\b))|"
@@ -319,6 +350,7 @@ def _capture_correction(log_path, prompt, transcript_path):
             corrected_from=(ai_last[:200] if ai_last else None),
             lang="", files=[], action_kind="clarify", source="chat",
         )
+        _maybe_reflect(log_path, summarize=True)   # a correction matters -> reflect now
     except Exception:
         pass
 
@@ -380,6 +412,7 @@ def _capture_reply(log_path, tool, target, ran):
             }) + "\n")
     except Exception:
         pass
+    _maybe_reflect(log_path)               # a reply/override matters -> reflect now
 
 
 # ---- incremental per-session summary; the gate checks AI actions against it ----
@@ -574,6 +607,8 @@ def cmd_hook(args):
                         reason = f"[codedouble] quality check — this doesn't fully meet the intent. {after}"
             _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"],
                           verdict=verdict, before=before, after=after, target=target)
+            if verdict == "deny":
+                _maybe_reflect(args.log)       # a send-back matters -> reflect now
             if enforce:
                 print(json.dumps({"hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
