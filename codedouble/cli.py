@@ -164,7 +164,7 @@ def _decide(log_path, payload, conf):
     return double.resolve(moment_of(payload), rev)
 
 
-def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict=""):
+def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after=""):
     d = os.path.dirname(log_path) or "."
     try:
         os.makedirs(d, exist_ok=True)
@@ -173,6 +173,8 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict=""):
                 "ts": time.time(), "event": event, "tool": tool,
                 "intent": (intent or "").strip()[:140],
                 "resolution": (dec.resolution or "").strip()[:140],
+                "before": (before or "").strip()[:200],   # what the AI proposed
+                "after": (after or "").strip()[:200],      # the correction the double asked for
                 "verdict": verdict,            # inject | allow | ask | deny | shadow | watch
                 "action": dec.action.value, "ask": dec.action.value == "ask",
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
@@ -301,15 +303,17 @@ def cmd_hook(args):
                 "reversibility": rev,
             }
             dec = _decide(args.log, payload, args.conf)
-            verdict, reason = "shadow", f"[codedouble] {dec.rationale}"
+            before = str(ti.get("new_string") or ti.get("content") or ti.get("command") or "")
+            verdict, reason, after = "shadow", f"[codedouble] {dec.rationale}", ""
             if enforce:
                 if dec.action is Action.ASK:
                     # default: surface for your approval (re-ask). Hard-deny is opt-in
                     # (CODEDOUBLE_DENY=1) so cold-start doesn't block your whole workflow.
                     if rev == "high" and os.environ.get("CODEDOUBLE_DENY") == "1":
                         verdict = "deny"      # reject & send back to redo
-                        reason = ("[codedouble] Hard to undo and no clear precedent you wanted it — "
-                                  "redo it more safely, or rerun if it's intended.")
+                        after = ("Redo it more safely (smaller / reversible), or rerun if it's intended."
+                                 if not dec.resolution else f"You usually prefer: {dec.resolution}")
+                        reason = f"[codedouble] Hard to undo and no clear precedent you wanted it — {after}"
                     else:
                         verdict = "ask"       # check with you (you can approve)
                         reason = (f"[codedouble] Under-determined; you've sometimes preferred "
@@ -326,9 +330,10 @@ def cmd_hook(args):
                     ok, refine = _quality_check(_last_prompt(args.log) or payload["request"], proposed)
                     if not ok:
                         verdict = "deny"
-                        reason = ("[codedouble] quality check — this doesn't fully meet the intent. "
-                                  + (refine or "Redo it to match what was asked, more carefully."))
-            _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"], verdict=verdict)
+                        after = refine or "Redo it to match what was asked, more carefully."
+                        reason = f"[codedouble] quality check — this doesn't fully meet the intent. {after}"
+            _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"],
+                          verdict=verdict, before=before, after=after)
             if enforce:
                 print(json.dumps({"hookSpecificOutput": {
                     "hookEventName": "PreToolUse",

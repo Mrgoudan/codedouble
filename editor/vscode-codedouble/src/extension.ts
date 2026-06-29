@@ -142,6 +142,7 @@ interface Panel {
   asked: number;      // paused to check with you
   rejected: number;   // rejected & sent back to redo
   interceptRate: number;
+  sentBack: Array<{ intent: string; before: string; after: string; rel: string }>;  // before → after
   recent: Array<{ intent: string; resolution: string; tag: string; conf: number; n: number; rel: string }>;
 }
 
@@ -189,6 +190,7 @@ function readPanel(): Panel {
   };
   let seen = 0, handled = 0, asked = 0, rejected = 0;
   const recent: Panel["recent"] = [];
+  const sentBack: Panel["sentBack"] = [];
   try {
     const lines = fs.readFileSync(decisionsPath(), "utf8").split("\n").filter((l) => l.trim());
     seen = lines.length;
@@ -208,10 +210,24 @@ function readPanel(): Panel {
         });
       } catch { /* skip */ }
     }
+    // every send-back (deny), newest first — the before → after people want to see
+    for (const l of lines.reverse()) {
+      if (sentBack.length >= 8) break;
+      try {
+        const r = JSON.parse(l);
+        if ((r.verdict === "deny") && (r.before || r.after)) {
+          sentBack.push({
+            intent: shortIntent(r.intent || r.tool || ""),
+            before: shortIntent(r.before || ""), after: shortIntent(r.after || r.resolution || ""),
+            rel: relTime(r.ts || 0),
+          });
+        }
+      } catch { /* skip */ }
+    }
   } catch { /* gateway not active yet */ }
   return {
     watching, repos: repos.size, reactions, overrides, seen, handled, asked, rejected,
-    interceptRate: seen ? Math.round((100 * (asked + rejected)) / seen) : 0, recent,
+    interceptRate: seen ? Math.round((100 * (asked + rejected)) / seen) : 0, sentBack, recent,
   };
 }
 
@@ -355,6 +371,8 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .rk{flex:1}.rn{font-weight:600}
       .rd{opacity:.6;font-size:10.5px;margin:1px 0 0 14px;line-height:1.35}
       .hint{opacity:.55;font-weight:400;text-transform:none;letter-spacing:0}
+      .ba{margin:3px 0 2px 2px;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+      .bf{color:#f85149}.af{color:#3fb950}
       button{width:100%;padding:6px;cursor:pointer;border:none;border-radius:4px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-top:14px}
       .muted{opacity:.5;font-size:10px;margin-top:10px;word-break:break-all}
       .empty{opacity:.72;font-size:11px;margin-top:8px;line-height:1.55}
@@ -372,6 +390,11 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
         decides: <b>let it through</b>, <b>pause and ask you</b>, or <b>reject &amp; send it back to redo</b> —
         learned from how you've accepted, edited, or reverted before. It infers from what you do; you never label anything.
         <i>(Acting requires enforce mode — otherwise these are what it <b>would</b> do.)</i></div>
+
+      <div id="sb">
+        <h4>Sent back to redo <span class="hint">— AI's version → what your double asked for</span></h4>
+        <ul id="sentback"></ul>
+      </div>
 
       <div id="react">
         <h4>Your reactions to AI changes</h4>
@@ -410,6 +433,10 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
           $('handled').textContent=s.handled||0;
           $('asked').textContent=s.asked||0;
           $('rejected').textContent=s.rejected||0;
+          $('sb').style.display=(s.sentBack&&s.sentBack.length)?'block':'none';
+          $('sentback').innerHTML=(s.sentBack||[]).map(o=>
+            '<li><div class="it"><span class="tag red">sent back</span><span class="iv">'+(o.intent||'')+'</span><span class="t">'+(o.rel||'')+'</span></div>'+
+            '<div class="ba"><span class="bf">AI: '+(o.before||'?')+'</span><br><span class="af">\\u2192 '+(o.after||'redo')+'</span></div></li>').join('');
           const seen=s.seen||0;
           $('has').style.display=seen?'block':'none';
           $('none').style.display=seen?'none':'block';
