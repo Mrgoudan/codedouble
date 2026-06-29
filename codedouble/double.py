@@ -59,6 +59,7 @@ class Double:
         sig = self.extractor.extract(moment)
         retrieved = self.index.retrieve(sig, now=self.now)
         raw_conf, winner, agreement, coverage = self.index.confidence(retrieved, self.now)
+        risk, risk_coverage = self.index.polarity(retrieved, self.now)
         conf = self.calibrator.transform(raw_conf)
         source = Source.INDEX if retrieved else Source.SITUATION
 
@@ -80,6 +81,7 @@ class Double:
 
         rationale = (
             f"conf={conf:.2f} (agree={agreement:.2f}, cover={coverage:.2f}), "
+            f"risk={risk:.2f}/{risk_coverage:.2f}, "
             f"rev={reversibility.value}, n={len(retrieved)} -> {action.value}"
         )
         return Decision(
@@ -92,6 +94,8 @@ class Double:
             rationale=rationale,
             signature=sig,
             retrieved=[e for e, _ in retrieved],
+            risk=risk,
+            risk_coverage=risk_coverage,
         )
 
     def record(

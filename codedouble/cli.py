@@ -305,22 +305,24 @@ def cmd_hook(args):
             dec = _decide(args.log, payload, args.conf)
             before = str(ti.get("new_string") or ti.get("content") or ti.get("command") or "")
             verdict, reason, after = "shadow", f"[codedouble] {dec.rationale}", ""
+            # KNOWN-BAD: you've OVERRIDDEN/REVERTED this kind of change before (negative
+            # precedent with coverage) — NOT "never seen". Only then send it back, and
+            # point at the specific fix you used last time. Unknown patterns are allowed
+            # (observe & learn). This is the calibration thesis: act on evidence, not ignorance.
+            known_bad = dec.risk >= 0.5 and dec.risk_coverage >= 0.35 and bool(dec.resolution)
             if enforce:
-                if dec.action is Action.ASK:
-                    # default: SEND BACK hard-to-undo, under-determined actions (reject &
-                    # redo). Soften to surface-for-approval with CODEDOUBLE_ASK=1.
-                    if rev == "high" and os.environ.get("CODEDOUBLE_ASK") != "1":
-                        verdict = "deny"      # reject & send back to redo (DEFAULT)
-                        after = (f"You usually prefer: {dec.resolution}" if dec.resolution
-                                 else "Redo it more safely (smaller / reversible), or rerun if it's intended.")
-                        reason = f"[codedouble] Hard to undo and no clear precedent you wanted it — {after}"
+                if known_bad:
+                    after = dec.resolution    # the specific thing you did instead (pinpoint)
+                    if os.environ.get("CODEDOUBLE_ASK") == "1":
+                        verdict = "ask"
+                        reason = (f"[codedouble] You've corrected this kind of change before "
+                                  f"({int(dec.risk * 100)}% of similar cases). Consider: {after}")
                     else:
-                        verdict = "ask"       # CODEDOUBLE_ASK=1, or low-reversibility
-                        reason = (f"[codedouble] Under-determined; you've sometimes preferred "
-                                  f"'{dec.resolution}' here." if dec.resolution
-                                  else "[codedouble] Hard-to-undo / under-determined — confirm this one.")
+                        verdict = "deny"      # send back with the pinpointed fix
+                        reason = (f"[codedouble] You've overridden this pattern before "
+                                  f"({int(dec.risk * 100)}% of similar cases). Do this instead: {after}")
                 else:
-                    verdict = "allow"         # handled for you
+                    verdict = "allow"         # unknown or known-good -> don't interrupt
             # Optional quality gate (opt-in, Edit/Write only): if the proposed change
             # doesn't meet the intent, reject + paraphrase + send it back to redo.
             if (enforce and verdict == "allow" and tool in ("Edit", "Write")

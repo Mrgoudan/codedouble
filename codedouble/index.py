@@ -25,6 +25,7 @@ from .types import (
     PreferenceRule,
     ResolutionEvent,
     Signature,
+    is_negative,
 )
 
 # tuning knobs (prototype defaults)
@@ -170,6 +171,26 @@ class ResolutionIndex:
         coverage = 1.0 - math.exp(-total / COVERAGE_TAU)    # is there enough?
         raw_conf = agreement * coverage
         return raw_conf, winner[0], agreement, coverage
+
+    # ---- known-bad signal: did the user REJECT this pattern before? -----------
+    def polarity(
+        self, retrieved: List[Tuple[ResolutionEvent, float]], now: float
+    ) -> Tuple[float, float]:
+        """Weighted fraction of NEGATIVE precedent (override/revert/interrupt) and
+        its coverage. High + covered => a *known-bad* pattern (send back). NOT
+        about ignorance — no precedent returns (0, 0), i.e. allow & observe."""
+        if not retrieved:
+            return 0.0, 0.0
+        bad = total = 0.0
+        for e, sim in retrieved:
+            recency = 0.5 ** ((now - e.ts) / RECENCY_HALFLIFE)
+            w = sim * recency * e.weight_base
+            total += w
+            if is_negative(e.outcome):
+                bad += w
+        if total <= 0:
+            return 0.0, 0.0
+        return bad / total, 1.0 - math.exp(-total / COVERAGE_TAU)
 
     # ---- persistence (event-sourced; vectors stored as lists) ----
     def save(self, path: str) -> None:

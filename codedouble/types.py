@@ -149,6 +149,10 @@ class Decision:
     signature: Signature
     # the precedent events that produced this (for transparency / "I assumed X because…")
     retrieved: List[ResolutionEvent] = field(default_factory=list)
+    # known-bad signal: weighted fraction of NEGATIVE precedent (you overrode/reverted
+    # similar before) and how much precedent backs it. Drives "send back", NOT ignorance.
+    risk: float = 0.0
+    risk_coverage: float = 0.0
 
 
 @dataclass
