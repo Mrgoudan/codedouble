@@ -115,6 +115,8 @@ function decisionsPath(): string {
 interface Panel {
   watching: number;   // interactions captured passively (all repos)
   repos: number;
+  reactions: Array<{ k: string; v: number }>;                 // your reactions, by kind
+  overrides: Array<{ file: string; from: string; to: string; rel: string }>;  // override detail
   seen: number;       // Claude actions the double weighed in on
   handled: number;    // let through without interrupting you
   asked: number;      // paused to check with you
@@ -128,14 +130,33 @@ function shortIntent(s: string): string {
 }
 
 function readPanel(): Panel {
-  // passive signal: how much it has watched (interactions.jsonl, all repos)
+  // passive signal: your reactions to AI changes (interactions.jsonl, all repos)
   let watching = 0; const repos = new Set<string>();
+  const rcounts: Record<string, number> = {};
+  const overrides: Panel["overrides"] = [];
   try {
+    const recs: Array<Record<string, unknown>> = [];
     for (const line of fs.readFileSync(logPath(), "utf8").split("\n")) {
       if (!line.trim()) continue; watching++;
-      try { const r = JSON.parse(line); if (r.repo) repos.add(r.repo); } catch { /* skip */ }
+      try {
+        const r = JSON.parse(line) as Record<string, unknown>;
+        recs.push(r);
+        const oc = String(r.outcome || "?");
+        rcounts[oc] = (rcounts[oc] || 0) + 1;
+        if (r.repo) repos.add(String(r.repo));
+      } catch { /* skip */ }
+    }
+    for (const r of recs.filter((x) => x.outcome === "override").slice(-8).reverse()) {
+      const files = (r.files as string[]) || [];
+      overrides.push({
+        file: String(files[0] || "").split("/").pop() || "",
+        from: shortIntent(String(r.corrected_from || "")),
+        to: shortIntent(String(r.resolution || "")),
+        rel: relTime(Number(r.ts) || 0),
+      });
     }
   } catch { /* none yet */ }
+  const reactions = Object.entries(rcounts).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ k, v }));
   // the double's act-vs-ask decisions on your real Claude usage (decisions.jsonl)
   let seen = 0, handled = 0, asked = 0;
   const recent: Panel["recent"] = [];
@@ -155,7 +176,7 @@ function readPanel(): Panel {
     }
   } catch { /* gateway not active yet */ }
   return {
-    watching, repos: repos.size, seen, handled, asked,
+    watching, repos: repos.size, reactions, overrides, seen, handled, asked,
     interceptRate: seen ? Math.round((100 * asked) / seen) : 0, recent,
   };
 }
@@ -285,6 +306,11 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .tag{font-size:9px;text-transform:uppercase;letter-spacing:.03em;padding:1px 6px;border-radius:9px;color:#fff;flex:none}
       .tag.green{background:#3fb950}.tag.amber{background:#d29922}
       .t{opacity:.7}
+      .rx{margin:7px 0}.rxh{display:flex;align-items:center;gap:6px}
+      .rdot{width:8px;height:8px;border-radius:50%;flex:none}
+      .rk{flex:1}.rn{font-weight:600}
+      .rd{opacity:.6;font-size:10.5px;margin:1px 0 0 14px;line-height:1.35}
+      .hint{opacity:.55;font-weight:400;text-transform:none;letter-spacing:0}
       button{width:100%;padding:6px;cursor:pointer;border:none;border-radius:4px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-top:14px}
       .muted{opacity:.5;font-size:10px;margin-top:10px;word-break:break-all}
       .empty{opacity:.72;font-size:11px;margin-top:8px;line-height:1.55}
@@ -300,6 +326,13 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       <div class="sub">When Claude changes code, your double decides whether to <b>let it through</b> or
         <b>pause and ask you</b> — learned from how you've accepted, edited, or reverted changes before.
         It infers from what you do; you never label anything.</div>
+
+      <div id="react">
+        <h4>Your reactions to AI changes</h4>
+        <div id="reactions"></div>
+        <h4>Recent overrides <span class="hint">— where you corrected the AI</span></h4>
+        <ul id="overrides"></ul>
+      </div>
 
       <div id="has">
         <h4>How often it interrupts you</h4>
@@ -342,6 +375,22 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
             return '<li><div class="it">'+tag+'<span class="iv">'+r.intent+'</span></div>'+
                    '<div class="inf">'+inf+'<span class="t">'+meta+'</span></div></li>';
           }).join('')||'<li class="inf">—</li>';
+          const RC={override:'#f85149',revert:'#f85149',interrupt:'#f85149',confirmed_good:'#3fb950',answered:'#3fb950',accepted_silent:'#8b949e',never_viewed:'#6e7681',pending:'#d29922'};
+          const RD={override:"you edited the AI's change — your strongest preference signal",
+            revert:"you undid the AI's change entirely",interrupt:"you stopped / rejected the change",
+            accepted_silent:"you kept it unchanged after seeing it — tacit approval",
+            never_viewed:"it settled before you scrolled to it — a weak signal",
+            confirmed_good:"you explicitly marked it good",answered:"the double asked and you answered",
+            pending:"awaiting your reaction"};
+          $('react').style.display=(s.watching?'block':'none');
+          $('reactions').innerHTML=(s.reactions||[]).map(o=>
+            '<div class="rx"><div class="rxh"><span class="rdot" style="background:'+(RC[o.k]||'#888')+'"></span>'+
+            '<span class="rk">'+o.k+'</span><span class="rn">'+o.v+'</span></div>'+
+            '<div class="rd">'+(RD[o.k]||'')+'</div></div>').join('');
+          $('overrides').innerHTML=(s.overrides||[]).map(o=>
+            '<li><div class="it"><span class="iv">'+(o.file||'?')+'</span><span class="t">'+(o.rel||'')+'</span></div>'+
+            '<div class="inf">'+(o.from?('AI: '+o.from+' \\u2192 you: '+(o.to||'?')):('you wrote: '+(o.to||'?')))+'</div></li>').join('')
+            ||'<li class="inf">no overrides yet — when you edit an AI change, the before\\u2192after appears here</li>';
           $('foot').textContent='Watching '+(s.watching||0)+' interactions'+
             (s.repos>1?(' across '+s.repos+' repos'):'')+' — passively, no buttons. '+(s.store||'~/.codedouble');
         });
