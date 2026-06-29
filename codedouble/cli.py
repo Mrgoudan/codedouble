@@ -180,60 +180,19 @@ def _cached_index(log_path, raw, ext):
     return idx
 
 
-def _load_rules(log_path):
-    """Distilled, generalised preferences (from `reflect`), keyed by coarse_key."""
-    p = os.path.join(os.path.dirname(log_path) or ".", "rules.jsonl")
-    rules = {}
-    try:
-        for line in open(p):
-            line = line.strip()
-            if not line:
-                continue
-            d = json.loads(line)
-            r = rules.setdefault(tuple(d.get("key") or []), {})
-            if d.get("avoid"):
-                r["avoid"] = True
-            if d.get("prefer"):
-                r["prefer"] = d["prefer"]
-            r["support"] = max(r.get("support", 0), d.get("support", 0))
-    except Exception:
-        pass
-    return rules
-
-
-def _apply_rules(log_path, dec):
-    """Let GENERALISED rules drive the gate: a coarse-key 'avoid' makes a novel
-    instance known-bad; a 'prefer' supplies the pinpoint fix even with no exact
-    event precedent. Specific event evidence still wins when stronger."""
-    rules = _load_rules(log_path)
-    if not rules:
-        return dec
-    try:
-        r = rules.get(tuple(dec.signature.coarse_key()))
-        if not r:
-            return dec
-        if not dec.resolution and r.get("prefer"):
-            dec.resolution = r["prefer"]                 # generalised pinpoint
-        if r.get("avoid"):                               # generalised known-bad
-            dec.risk = max(dec.risk, 0.8)
-            dec.risk_coverage = max(dec.risk_coverage, 0.5)
-            if not dec.resolution and r.get("prefer"):
-                dec.resolution = r["prefer"]
-    except Exception:
-        pass
-    return dec
-
-
 def _decide(log_path, payload, conf):
-    """Run one gateway decision (fast: hashing embedder, cached index, + rules)."""
+    """Run one gateway decision: hashing embedder + cached index (Tier 1/2) +
+    distilled rules (Tier 3, abstract). The tiered combine lives in Double.resolve."""
     from .double import Double
     from .types import Reversibility
     raw = EventLog(log_path).read()
     ext = RuleBasedExtractor(HashingEmbedder(256))
-    double = Double(ext, _cached_index(log_path, raw, ext), conf_threshold=conf)
+    idx = _cached_index(log_path, raw, ext)
+    idx.semantic.load_rules(os.path.join(os.path.dirname(log_path) or ".", "rules.jsonl"))
+    double = Double(ext, idx, conf_threshold=conf)
     double.now = float(len(raw) + 1)
     rev = Reversibility.HIGH if payload.get("reversibility") == "high" else Reversibility.LOW
-    return _apply_rules(log_path, double.resolve(moment_of(payload), rev))
+    return double.resolve(moment_of(payload), rev)
 
 
 def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after=""):

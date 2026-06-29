@@ -72,10 +72,13 @@ def _determinacy(sig: Signature) -> float:
 
 
 class SemanticStore:
-    """Distilled, stable preferences (the 'rules' reflection produces)."""
+    """Distilled, stable preferences (the 'rules' reflection produces) — the
+    abstract tier. `prefer` rules give a generalised resolution; `avoid` marks a
+    coarse-key category the user repeatedly corrects."""
 
     def __init__(self) -> None:
-        self.rules: Dict[Tuple, PreferenceRule] = {}
+        self.rules: Dict[Tuple, PreferenceRule] = {}   # coarse_key -> prefer
+        self.avoid: Dict[Tuple, float] = {}            # coarse_key -> support (known-bad)
 
     def upsert(self, key: Tuple, resolution: str, support: int, ts: float) -> None:
         existing = self.rules.get(key)
@@ -84,6 +87,36 @@ class SemanticStore:
 
     def get(self, key: Tuple) -> Optional[PreferenceRule]:
         return self.rules.get(key)
+
+    def load_rules(self, path: str) -> None:
+        """Load distilled rules (from `reflect`) into the abstract tier."""
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    key = tuple(d.get("key") or [])
+                    sup = float(d.get("support", 1))
+                    if d.get("avoid"):
+                        self.avoid[key] = max(self.avoid.get(key, 0.0), sup)
+                    if d.get("prefer"):
+                        self.upsert(key, d["prefer"], int(sup), 0.0)
+        except Exception:
+            pass
+
+    def lookup(self, sig: Signature):
+        """Abstract-first match by coarse_key, with backoff (drop error_type, then
+        action_kind). Returns (prefer_resolution|None, avoid_support, support)."""
+        lang, phr, act, err = sig.coarse_key()
+        for key in ((lang, phr, act, err), (lang, phr, act, None),
+                    (lang, phr, None, None), (lang, None, act, None)):
+            r = self.rules.get(key)
+            av = self.avoid.get(key, 0.0)
+            if r or av:
+                return (r.resolution if r else None, av, r.support if r else 0)
+        return (None, 0.0, 0)
 
 
 class Calibrator:

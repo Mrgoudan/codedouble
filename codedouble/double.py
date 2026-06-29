@@ -63,6 +63,20 @@ class Double:
         conf = self.calibrator.transform(raw_conf)
         source = Source.INDEX if retrieved else Source.SITUATION
 
+        # Tier-3 (abstract-first): distilled, generalised rules consulted with
+        # coarse-key backoff. They supply a pinpoint when specific precedent is thin,
+        # and flag a known-bad *category* (one you repeatedly correct) even for a
+        # never-seen specific instance. Specific event evidence still wins when stronger.
+        pref, avoid_sup, _rsup = self.index.semantic.lookup(sig)
+        if winner is None and pref:
+            winner = pref
+            source = Source.COHORT          # generalised prior, not one specific event
+        if avoid_sup >= 3 and risk < 0.5:
+            risk = max(risk, 0.75)
+            risk_coverage = max(risk_coverage, 0.5)
+            if winner is None and pref:
+                winner = pref
+
         action = gate(conf, reversibility, self.conf_threshold)
 
         # nothing to act on (no precedent guess) -> must ask, regardless of 2x2
