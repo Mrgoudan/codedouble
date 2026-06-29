@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
 import sys
 
@@ -270,6 +271,58 @@ def _quality_check(intent, proposed):
         return True, ""
 
 
+# the conversational signal we were missing: you correcting the AI's UNDERSTANDING
+_CORRECTION_RE = re.compile(
+    r"(^\s*(no\b|nope\b|actually\b|wrong\b))|"
+    r"(i meant|i mean\b|you mis|misunderstood|understood me|that'?s not|not what i|"
+    r"you'?re wrong|you got it wrong|instead of|rather than|the point is|i said\b)", re.I)
+
+
+def _last_assistant_text(transcript_path):
+    """Best-effort: the AI's previous turn (what the correction is aimed at)."""
+    if not transcript_path:
+        return ""
+    try:
+        with open(transcript_path) as f:
+            lines = f.readlines()[-40:]
+        for line in reversed(lines):
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            msg = d.get("message") or d
+            role = d.get("type") or d.get("role") or msg.get("role")
+            if role == "assistant":
+                c = msg.get("content")
+                if isinstance(c, str):
+                    return c[:300]
+                if isinstance(c, list):
+                    for part in c:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            return (part.get("text") or "")[:300]
+    except Exception:
+        pass
+    return ""
+
+
+def _capture_correction(log_path, prompt, transcript_path):
+    """When your message CORRECTS the AI's understanding (not a new task), record it
+    as a gold intent-correction — the conceptual misunderstanding signal the
+    code-action capture misses. Heuristic for now; an LLM classifier would be precise."""
+    p = (prompt or "").strip()
+    if len(p) < 4 or not _CORRECTION_RE.search(p[:160]):
+        return
+    ai_last = _last_assistant_text(transcript_path)
+    try:
+        record_interaction(
+            EventLog(log_path), request=p[:140], resolution=p[:200], outcome="override",
+            corrected_from=(ai_last[:200] if ai_last else None),
+            lang="", files=[], action_kind="clarify", source="chat",
+        )
+    except Exception:
+        pass
+
+
 def _capture_reply(log_path, tool, target, ran):
     """The double sent the AI back on this action and it has now completed — record the
     OUTCOME as a high-quality signal (you only ever talk to the AI): ANSWERED if the
@@ -378,6 +431,7 @@ def cmd_hook(args):
 
         if name == "UserPromptSubmit":
             prompt = ev.get("prompt", "")
+            _capture_correction(args.log, prompt, ev.get("transcript_path"))   # learn from "no, I meant X"
             dec = _decide(args.log, {"request": prompt, "reversibility": "low"}, args.conf)
             injected = bool(dec.retrieved and dec.confidence >= 0.4 and dec.resolution)
             _log_decision(args.log, name, None, dec, enforce, intent=prompt,
