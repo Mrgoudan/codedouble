@@ -308,6 +308,10 @@ _CORRECTION_RE = re.compile(
     r"(i meant|i mean\b|you mis|misunderstood|understood me|that'?s not|not what i|"
     r"you'?re wrong|you got it wrong|instead of|rather than|the point is|i said\b)", re.I)
 
+# a decision being made is also a moment that matters -> re-anchor
+_DECISION_RE = re.compile(
+    r"\b(let'?s\b|go with|we'?ll\b|we will\b|decided|the plan is|stick with|going with|finali[sz]e)\b", re.I)
+
 
 def _last_assistant_text(transcript_path):
     """Best-effort: the AI's previous turn (what the correction is aimed at)."""
@@ -438,37 +442,65 @@ def _session_note(log_path, sid, prompt):
         pass
 
 
-def _session_summary(log_path, sid):
-    """The session's established intent — the consolidated summary if present, else
-    the recent running notes (so the check works even before consolidation)."""
+_ANCHORS_SYSTEM = (
+    "Extract the durable ANCHORS of this coding session from the developer's prompts. "
+    "Return ONLY JSON: {\"goal\": \"<the end goal in one sentence>\", "
+    "\"constraints\": [hard requirements that must hold], "
+    "\"decisions\": [decisions already made — do NOT re-litigate], "
+    "\"todos\": [open tasks still to do], \"avoid\": [approaches they rejected]}. "
+    "Each item one short line; omit empties."
+)
+
+
+def _consolidate(notes):
+    """Distil running notes into structured ANCHORS (JSON). Local LLM if available;
+    a minimal extractive anchor set otherwise."""
+    text = "\n".join(f"- {n}" for n in notes[-50:])
     try:
-        sp = _sid_file(log_path, sid, ".summary.txt")
-        if os.path.exists(sp):
-            return open(sp).read()[:1600]
+        from .backends import OllamaClient
+        out = OllamaClient(model=resolve_ollama_model(None), timeout=90).chat(
+            text, system=_ANCHORS_SYSTEM, json_mode=True)
+        json.loads(out)                       # validate
+        return out
+    except Exception:
+        return json.dumps({"goal": "", "constraints": [], "decisions": [],
+                           "todos": [n[:160] for n in notes[-8:]], "avoid": []})
+
+
+def _render_anchors(a):
+    parts = []
+    if a.get("goal"):
+        parts.append("Goal: " + str(a["goal"]))
+    for label, key in (("Constraints", "constraints"), ("Decisions made", "decisions"),
+                       ("TODO", "todos"), ("Avoid", "avoid")):
+        items = a.get(key) or []
+        if items:
+            parts.append(label + ":\n" + "\n".join("  - " + str(x)[:160] for x in items[:8]))
+    return "\n".join(parts)[:1600]
+
+
+def _session_anchors(log_path, sid):
+    """Structured anchors (rendered) — '' until consolidated. For steering the AI."""
+    try:
+        ap = _sid_file(log_path, sid, ".anchors.json")
+        if os.path.exists(ap):
+            return _render_anchors(json.loads(open(ap).read()))
     except Exception:
         pass
+    return ""
+
+
+def _session_summary(log_path, sid):
+    """What the gate checks AI actions against: the structured anchors if
+    consolidated, else the recent running notes."""
+    a = _session_anchors(log_path, sid)
+    if a:
+        return a
     try:
         lines = open(_sid_file(log_path, sid, ".jsonl")).readlines()[-12:]
         return "\n".join("- " + json.loads(l).get("prompt", "")[:160] for l in lines)[:1600]
     except Exception:
         return ""
-
-
-_SUMMARY_SYSTEM = (
-    "Consolidate these developer prompts from one coding session into a compact, "
-    "durable summary of INTENT: what they want, key decisions, constraints, "
-    "preferences, and corrections. 4-7 short bullets, no preamble."
-)
-
-
-def _consolidate(notes):
-    text = "\n".join(f"- {n}" for n in notes[-40:])
-    try:
-        from .backends import OllamaClient
-        return OllamaClient(model=resolve_ollama_model(None), timeout=60).chat(
-            text, system=_SUMMARY_SYSTEM, json_mode=False)[:1600]
-    except Exception:
-        return text[:1600]      # fail-open: extractive (the notes themselves)
 
 
 def cmd_summarize(args):
@@ -484,7 +516,7 @@ def cmd_summarize(args):
         if not notes:
             continue
         try:
-            with open(notes_path[:-6] + ".summary.txt", "w") as f:
+            with open(notes_path[:-6] + ".anchors.json", "w") as f:
                 f.write(_consolidate(notes))
             n += 1
         except Exception:
@@ -548,13 +580,20 @@ def cmd_hook(args):
             injected = bool(dec.retrieved and dec.confidence >= 0.4 and dec.resolution)
             _log_decision(args.log, name, None, dec, enforce, intent=prompt,
                           verdict=("inject" if injected else "watch"))
+            if _DECISION_RE.search(prompt):
+                _maybe_reflect(args.log, summarize=True)      # a decision was made -> re-anchor
+            blocks = []
+            anchors = _session_anchors(args.log, ev.get("session_id", ""))
+            if anchors:
+                blocks.append("[codedouble] Session anchors — stay within these (goal / constraints / "
+                              "decisions already made / todos):\n" + anchors)
             if injected:
-                # steer the input toward what the developer has consistently preferred
-                ctx = (f"[codedouble] The developer has consistently preferred '{dec.resolution}' "
-                       f"for this kind of request ({len(dec.retrieved)} precedents, "
-                       f"confidence {dec.confidence:.2f}). Apply that approach unless this case clearly differs.")
+                blocks.append(f"[codedouble] The developer has consistently preferred '{dec.resolution}' "
+                              f"for this kind of request ({len(dec.retrieved)} precedents, "
+                              f"confidence {dec.confidence:.2f}). Apply it unless this case clearly differs.")
+            if blocks:
                 print(json.dumps({"hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
+                    "hookEventName": "UserPromptSubmit", "additionalContext": "\n\n".join(blocks)}}))
             return
 
         if name == "PreToolUse":
