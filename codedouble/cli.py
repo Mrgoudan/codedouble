@@ -26,6 +26,7 @@ from .embedder import HashingEmbedder
 from .logger import (
     DEFAULT_LOG,
     EventLog,
+    _lang_of,
     build_index,
     capture_git,
     codedouble_home,
@@ -195,7 +196,7 @@ def _decide(log_path, payload, conf):
     return double.resolve(moment_of(payload), rev)
 
 
-def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after=""):
+def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after="", target=""):
     d = os.path.dirname(log_path) or "."
     path = os.path.join(d, "decisions.jsonl")
     try:
@@ -203,11 +204,12 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", be
         with open(path, "a") as f:
             f.write(json.dumps({
                 "ts": time.time(), "event": event, "tool": tool,
+                "target": (target or "").strip()[:160],   # file / command (for reply correlation)
                 "intent": (intent or "").strip()[:140],
                 "resolution": (dec.resolution or "").strip()[:140],
                 "before": (before or "").strip()[:200],   # what the AI proposed
                 "after": (after or "").strip()[:200],      # the correction the double asked for
-                "verdict": verdict,            # inject | allow | ask | deny | shadow | watch
+                "verdict": verdict,            # inject | allow | ask | deny | answered | shadow | watch
                 "action": dec.action.value, "ask": dec.action.value == "ask",
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
                 "n": len(dec.retrieved), "enforce": enforce,
@@ -266,6 +268,64 @@ def _quality_check(intent, proposed):
         return bool(data.get("ok", True)), str(data.get("refine", ""))[:200]
     except Exception:
         return True, ""
+
+
+def _capture_reply(log_path, tool, target, ran):
+    """The double asked/denied on this action and it has now completed — record the
+    user's REPLY as the gold signal: ANSWERED if they kept the flagged action (also
+    tells the double it over-intervened), OVERRIDE if they redid it differently."""
+    if not target:
+        return
+    dpath = os.path.join(os.path.dirname(log_path) or ".", "decisions.jsonl")
+    now = time.time()
+    try:
+        with open(dpath) as f:
+            lines = f.readlines()[-600:]
+    except Exception:
+        return
+    inter, handled = None, False
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("tool") != tool or r.get("target") != target:
+            continue
+        v = r.get("verdict")
+        if v in ("ask", "deny") and (now - r.get("ts", 0)) < 900:
+            inter, handled = r, False        # a fresh intervention to attribute
+        elif v == "answered":
+            handled = True                   # already attributed
+    if inter is None or handled:
+        return
+    proposed = (inter.get("before") or "").strip()
+    rann = (ran or "").strip()
+    def norm(s):
+        return " ".join(s.split())[:200]
+    if proposed and norm(rann) != norm(proposed):
+        outcome, resolution, corrected = "override", rann, proposed   # redone differently
+    else:
+        outcome, resolution, corrected = "answered", (rann or inter.get("intent", "")), None
+    files = [target] if tool in ("Edit", "Write") else []
+    try:
+        record_interaction(
+            EventLog(log_path), request=inter.get("intent", f"{tool} {target}"),
+            resolution=(resolution or "")[:200], outcome=outcome,
+            corrected_from=(corrected[:200] if corrected else None),
+            lang=_lang_of(files), files=files, action_kind="edit", source="reply",
+        )
+    except Exception:
+        pass
+    try:                                     # mark handled so we attribute once
+        with open(dpath, "a") as f:
+            f.write(json.dumps({
+                "ts": now, "event": "PreToolUse", "tool": tool, "target": (target or "")[:160],
+                "intent": inter.get("intent", ""), "resolution": (resolution or "")[:140],
+                "before": "", "after": "", "verdict": "answered",
+                "action": "act", "ask": False, "confidence": 0, "coverage": 0, "n": 0, "enforce": True,
+            }) + "\n")
+    except Exception:
+        pass
 
 
 def cmd_gate(args):
@@ -345,6 +405,7 @@ def cmd_hook(args):
             }
             dec = _decide(args.log, payload, args.conf)
             before = str(ti.get("new_string") or ti.get("content") or ti.get("command") or "")
+            target = str(ti.get("file_path") or ti.get("command") or "")
             verdict, reason, after = "shadow", f"[codedouble] {dec.rationale}", ""
             # KNOWN-BAD: you've OVERRIDDEN/REVERTED this kind of change before (negative
             # precedent with coverage) — NOT "never seen". Only then send it back, and
@@ -376,13 +437,22 @@ def cmd_hook(args):
                         after = refine or "Redo it to match what was asked, more carefully."
                         reason = f"[codedouble] quality check — this doesn't fully meet the intent. {after}"
             _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"],
-                          verdict=verdict, before=before, after=after)
+                          verdict=verdict, before=before, after=after, target=target)
             if enforce:
                 print(json.dumps({"hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": ("deny" if verdict == "deny" else verdict),
                     "permissionDecisionReason": reason}}))
             return  # shadow: emit nothing -> normal flow
+
+        if name == "PostToolUse":
+            # the action the double asked/denied about has completed -> capture the reply
+            tool = ev.get("tool_name", "")
+            ti = ev.get("tool_input", {}) or {}
+            target = str(ti.get("file_path") or ti.get("command") or "")
+            ran = str(ti.get("new_string") or ti.get("content") or ti.get("command") or "")
+            _capture_reply(args.log, tool, target, ran)
+            return
     except Exception:
         return  # fail-open: never block the user's session
 
