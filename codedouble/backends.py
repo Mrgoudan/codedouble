@@ -243,6 +243,46 @@ def list_ollama_models(host: Optional[str] = None) -> List[str]:
         return []
 
 
+class OpenAICompatLLM:
+    """Any OpenAI-compatible chat endpoint (OpenAI, vLLM, Ollama's /v1, a gateway).
+    The 'port' you fill in via CODEDOUBLE_LLM_BASE_URL / _API_KEY / _MODEL."""
+
+    def __init__(self, base_url=None, api_key=None, model=None):
+        self.base = (base_url or os.environ.get("CODEDOUBLE_LLM_BASE_URL", "")).rstrip("/")
+        self.key = api_key or os.environ.get("CODEDOUBLE_LLM_API_KEY", "")
+        self.model = model or os.environ.get("CODEDOUBLE_LLM_MODEL", "gpt-4o-mini")
+
+    def chat(self, prompt: str, system: Optional[str] = None,
+             json_mode: bool = False, timeout: float = 90.0) -> str:
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        payload = {"model": self.model, "messages": msgs, "temperature": 0}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        req = urllib.request.Request(self.base + "/chat/completions",
+                                     data=json.dumps(payload).encode(), headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())["choices"][0]["message"]["content"]
+
+
+def llm_complete(prompt, system=None, json_mode=False, timeout=90.0) -> str:
+    """LLM-FIRST, local-fallback dispatcher for the semantic 'hunting' tasks. Tries
+    the configured LLM port; else a local Ollama model; else raises (callers then
+    fall back to their cheap heuristic)."""
+    if os.environ.get("CODEDOUBLE_LLM_BASE_URL"):
+        return OpenAICompatLLM().chat(prompt, system, json_mode, timeout)
+    models = list_ollama_models()
+    if models:
+        model = os.environ.get("CODEDOUBLE_OLLAMA_MODEL") or models[0]
+        return OllamaClient(model=model, timeout=timeout).chat(prompt, system, json_mode)
+    raise RuntimeError("no LLM endpoint available (set CODEDOUBLE_LLM_BASE_URL or run ollama)")
+
+
 def ollama_extractor(embedder: Embedder, model: Optional[str] = None) -> LLMExtractor:
     """LLMExtractor whose reasoning runs on a LOCAL Ollama model; embeddings come
     from the given (local) embedder. Fully offline once the model is pulled."""

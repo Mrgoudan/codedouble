@@ -259,12 +259,9 @@ def _quality_check(intent, proposed):
     """Ask the LOCAL model whether the change meets the intent. Returns
     (ok, refine). Fail-open: any error -> ok=True (never block on QC failure)."""
     try:
-        from .backends import OllamaClient
-        client = OllamaClient(model=resolve_ollama_model(None), timeout=40)
-        out = client.chat(
-            f"Intent:\n{intent}\n\nProposed change:\n{proposed[:2000]}",
-            system=_QC_SYSTEM, json_mode=True,
-        )
+        from .backends import llm_complete                       # LLM-first (port -> ollama)
+        out = llm_complete(f"Intent:\n{intent}\n\nProposed change:\n{proposed[:2000]}",
+                           system=_QC_SYSTEM, json_mode=True, timeout=40)
         data = json.loads(out)
         return bool(data.get("ok", True)), str(data.get("refine", ""))[:200]
     except Exception:
@@ -457,9 +454,8 @@ def _consolidate(notes):
     a minimal extractive anchor set otherwise."""
     text = "\n".join(f"- {n}" for n in notes[-50:])
     try:
-        from .backends import OllamaClient
-        out = OllamaClient(model=resolve_ollama_model(None), timeout=90).chat(
-            text, system=_ANCHORS_SYSTEM, json_mode=True)
+        from .backends import llm_complete                       # LLM-first (port -> ollama)
+        out = llm_complete(text, system=_ANCHORS_SYSTEM, json_mode=True, timeout=90)
         json.loads(out)                       # validate
         return out
     except Exception:
@@ -479,12 +475,52 @@ def _render_anchors(a):
     return "\n".join(parts)[:1600]
 
 
+def _global_anchors_path(log_path):
+    return os.path.join(os.path.dirname(log_path) or ".", "anchors.global.json")
+
+
+def _merge_global(log_path, a):
+    """Graduate a session's durable anchors (constraints / decisions / avoid) into
+    the cross-session GLOBAL anchors — the local→over-time bridge. Union+dedupe
+    (an LLM dedupe could refine this later)."""
+    if not isinstance(a, dict):
+        return
+    gp = _global_anchors_path(log_path)
+    try:
+        g = json.loads(open(gp).read()) if os.path.exists(gp) else {}
+    except Exception:
+        g = {}
+    for key in ("constraints", "decisions", "avoid"):
+        seen = {str(x).strip().lower() for x in (g.get(key) or [])}
+        merged = list(g.get(key) or [])
+        for x in (a.get(key) or []):
+            s = str(x).strip()
+            if s and s.lower() not in seen:
+                merged.append(x); seen.add(s.lower())
+        g[key] = merged[-40:]
+    if a.get("goal") and not g.get("goal"):
+        g["goal"] = a["goal"]
+    try:
+        with open(gp, "w") as f:
+            f.write(json.dumps(g))
+    except Exception:
+        pass
+
+
 def _session_anchors(log_path, sid):
-    """Structured anchors (rendered) — '' until consolidated. For steering the AI."""
+    """Anchors (rendered) for steering. The session's own anchors if consolidated;
+    else SEED from the durable global anchors so a fresh session starts primed
+    (over-time→local), not blank."""
     try:
         ap = _sid_file(log_path, sid, ".anchors.json")
         if os.path.exists(ap):
             return _render_anchors(json.loads(open(ap).read()))
+    except Exception:
+        pass
+    try:
+        gp = _global_anchors_path(log_path)
+        if os.path.exists(gp):
+            return _render_anchors(json.loads(open(gp).read()))
     except Exception:
         pass
     return ""
@@ -515,9 +551,11 @@ def cmd_summarize(args):
             continue
         if not notes:
             continue
+        anchors_json = _consolidate(notes)
         try:
             with open(notes_path[:-6] + ".anchors.json", "w") as f:
-                f.write(_consolidate(notes))
+                f.write(anchors_json)
+            _merge_global(args.log, json.loads(anchors_json))     # graduate -> global (over-time)
             n += 1
         except Exception:
             pass
