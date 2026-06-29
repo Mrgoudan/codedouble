@@ -243,14 +243,60 @@ def list_ollama_models(host: Optional[str] = None) -> List[str]:
         return []
 
 
-class OpenAICompatLLM:
-    """Any OpenAI-compatible chat endpoint (OpenAI, vLLM, Ollama's /v1, a gateway).
-    The 'port' you fill in via CODEDOUBLE_LLM_BASE_URL / _API_KEY / _MODEL."""
+def _read_env_field(path, field):
+    """Read FIELD=value from a .env-style file (so an API key need not be duplicated)."""
+    if not path or not field:
+        return ""
+    try:
+        for line in open(os.path.expanduser(path)):
+            line = line.strip()
+            if line.startswith(field + "="):
+                return line.split("=", 1)[1].strip().strip("\"'")
+    except Exception:
+        pass
+    return ""
 
-    def __init__(self, base_url=None, api_key=None, model=None):
-        self.base = (base_url or os.environ.get("CODEDOUBLE_LLM_BASE_URL", "")).rstrip("/")
-        self.key = api_key or os.environ.get("CODEDOUBLE_LLM_API_KEY", "")
-        self.model = model or os.environ.get("CODEDOUBLE_LLM_MODEL", "gpt-4o-mini")
+
+def _llm_config():
+    """Resolve the LLM 'port' (base_url, [keys], model) from env then
+    ~/.codedouble/llm.json. api_key_field may be a LIST -> key ROTATION (try the next
+    on 429/auth, like glm_run.sh). The key stays referenced in its .env, not copied."""
+    base = os.environ.get("CODEDOUBLE_LLM_BASE_URL", "")
+    model = os.environ.get("CODEDOUBLE_LLM_MODEL", "")
+    env_key = os.environ.get("CODEDOUBLE_LLM_API_KEY", "")
+    keys = [env_key] if env_key else []
+    if not base or not keys:
+        home = os.environ.get("CODEDOUBLE_HOME") or os.path.join(os.path.expanduser("~"), ".codedouble")
+        try:
+            d = json.load(open(os.path.join(home, "llm.json")))
+            base = base or d.get("base_url", "")
+            model = model or d.get("model", "")
+            if not keys:
+                if d.get("api_key"):
+                    keys = [d["api_key"]]
+                else:
+                    fields = d.get("api_key_field", [])
+                    if isinstance(fields, str):
+                        fields = [fields]
+                    path = d.get("api_key_file", "")
+                    keys = [k for k in (_read_env_field(path, f) for f in fields) if k]
+        except Exception:
+            pass
+    return base.rstrip("/"), keys, (model or "gpt-4o-mini")
+
+
+class OpenAICompatLLM:
+    """Any OpenAI-compatible chat endpoint (OpenAI, vLLM, Ollama's /v1, the GLM
+    gateway). Filled via CODEDOUBLE_LLM_* env or ~/.codedouble/llm.json. Rotates
+    across keys on 429/auth, like glm_run.sh."""
+
+    def __init__(self, base_url=None, keys=None, model=None):
+        b, k, m = _llm_config()
+        self.base = (base_url or b).rstrip("/")
+        self.keys = keys if keys is not None else k
+        if isinstance(self.keys, str):
+            self.keys = [self.keys]
+        self.model = model or m
 
     def chat(self, prompt: str, system: Optional[str] = None,
              json_mode: bool = False, timeout: float = 90.0) -> str:
@@ -261,26 +307,37 @@ class OpenAICompatLLM:
         payload = {"model": self.model, "messages": msgs, "temperature": 0}
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        headers = {"Content-Type": "application/json"}
-        if self.key:
-            headers["Authorization"] = f"Bearer {self.key}"
-        req = urllib.request.Request(self.base + "/chat/completions",
-                                     data=json.dumps(payload).encode(), headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())["choices"][0]["message"]["content"]
+        data = json.dumps(payload).encode()
+        last = None
+        for key in (self.keys or [""]):
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            req = urllib.request.Request(self.base + "/chat/completions",
+                                         data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode())["choices"][0]["message"]["content"]
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code in (401, 403, 429):     # key exhausted / rate-limited -> rotate
+                    continue
+                raise
+        raise last or RuntimeError("LLM port: all keys failed")
 
 
 def llm_complete(prompt, system=None, json_mode=False, timeout=90.0) -> str:
     """LLM-FIRST, local-fallback dispatcher for the semantic 'hunting' tasks. Tries
-    the configured LLM port; else a local Ollama model; else raises (callers then
-    fall back to their cheap heuristic)."""
-    if os.environ.get("CODEDOUBLE_LLM_BASE_URL"):
-        return OpenAICompatLLM().chat(prompt, system, json_mode, timeout)
+    the configured LLM port (with key rotation); else a local Ollama model; else
+    raises (callers then fall back to their cheap heuristic)."""
+    base, keys, model = _llm_config()
+    if base:
+        return OpenAICompatLLM(base, keys, model).chat(prompt, system, json_mode, timeout)
     models = list_ollama_models()
     if models:
-        model = os.environ.get("CODEDOUBLE_OLLAMA_MODEL") or models[0]
-        return OllamaClient(model=model, timeout=timeout).chat(prompt, system, json_mode)
-    raise RuntimeError("no LLM endpoint available (set CODEDOUBLE_LLM_BASE_URL or run ollama)")
+        m = os.environ.get("CODEDOUBLE_OLLAMA_MODEL") or models[0]
+        return OllamaClient(model=m, timeout=timeout).chat(prompt, system, json_mode)
+    raise RuntimeError("no LLM endpoint available (set CODEDOUBLE_LLM_BASE_URL / ~/.codedouble/llm.json, or run ollama)")
 
 
 def ollama_extractor(embedder: Embedder, model: Optional[str] = None) -> LLMExtractor:
