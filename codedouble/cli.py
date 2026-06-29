@@ -303,15 +303,18 @@ def cmd_hook(args):
             dec = _decide(args.log, payload, args.conf)
             verdict, reason = "shadow", f"[codedouble] {dec.rationale}"
             if enforce:
-                if dec.action is Action.ASK and rev == "high":
-                    verdict = "deny"          # reject & re-ask: hard to undo + under-determined
-                    reason = ("[codedouble] This is hard to undo and I have no clear precedent that "
-                              "you wanted it. Redo it more safely, or rerun if it's intended.")
-                elif dec.action is Action.ASK:
-                    verdict = "ask"           # check with you
-                    reason = (f"[codedouble] Under-determined; you've sometimes preferred "
-                              f"'{dec.resolution}' here." if dec.resolution
-                              else "[codedouble] Under-determined — worth a quick check.")
+                if dec.action is Action.ASK:
+                    # default: surface for your approval (re-ask). Hard-deny is opt-in
+                    # (CODEDOUBLE_DENY=1) so cold-start doesn't block your whole workflow.
+                    if rev == "high" and os.environ.get("CODEDOUBLE_DENY") == "1":
+                        verdict = "deny"      # reject & send back to redo
+                        reason = ("[codedouble] Hard to undo and no clear precedent you wanted it — "
+                                  "redo it more safely, or rerun if it's intended.")
+                    else:
+                        verdict = "ask"       # check with you (you can approve)
+                        reason = (f"[codedouble] Under-determined; you've sometimes preferred "
+                                  f"'{dec.resolution}' here." if dec.resolution
+                                  else "[codedouble] Hard-to-undo / under-determined — confirm this one.")
                 else:
                     verdict = "allow"         # handled for you
             # Optional quality gate (opt-in, Edit/Write only): if the proposed change
