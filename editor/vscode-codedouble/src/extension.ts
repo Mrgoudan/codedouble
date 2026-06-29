@@ -248,7 +248,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     flashDeco, statusBar,
-    vscode.window.registerWebviewViewProvider("codedouble.view", view),
+    vscode.window.registerWebviewViewProvider("cdCaptureView", view),
     vscode.workspace.onDidChangeTextDocument(onChange),
     vscode.window.onDidChangeTextEditorVisibleRanges(onVisible),
 
