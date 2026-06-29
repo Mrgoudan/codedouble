@@ -142,10 +142,9 @@ interface Panel {
   learned: number;    // distilled preference rules (from reflection)
   reactions: Array<{ k: string; v: number }>;                 // your reactions, by kind
   overrides: Array<{ file: string; from: string; to: string; rel: string }>;  // override detail
-  seen: number;       // Claude actions the double weighed in on
-  handled: number;    // let through without interrupting you
-  asked: number;      // paused to check with you
-  rejected: number;   // rejected & sent back to redo
+  seen: number;       // AI actions the double weighed in on
+  handled: number;    // let through, on your behalf
+  rejected: number;   // sent back to the AI to redo
   interceptRate: number;
   sentBack: Array<{ intent: string; before: string; after: string; rel: string }>;  // before → after
   recent: Array<{ intent: string; resolution: string; tag: string; conf: number; n: number; rel: string }>;
@@ -186,14 +185,14 @@ function readPanel(): Panel {
   const reactions = Object.entries(rcounts).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ k, v }));
   // the double's verdicts on your real Claude usage (decisions.jsonl)
   // verdict: inject/allow = handled, ask = checked, deny = rejected (shadow falls back to would-ask)
+  // the double acts toward the AI: "sent back" (deny / legacy ask) vs "handled" (let through)
   const tagOf = (r: Record<string, unknown>): string => {
     const v = r.verdict as string | undefined;
-    if (v === "deny") return "rejected";
-    if (v === "ask") return "checked";
-    if (v === undefined || v === "shadow") return r.ask ? "checked" : "handled";
-    return "handled"; // inject | allow | watch
+    if (v === "deny" || v === "ask") return "sent back";
+    if (v === undefined || v === "shadow") return r.ask ? "sent back" : "handled";
+    return "handled"; // inject | allow | watch | answered
   };
-  let seen = 0, handled = 0, asked = 0, rejected = 0;
+  let seen = 0, handled = 0, rejected = 0;
   const recent: Panel["recent"] = [];
   const sentBack: Panel["sentBack"] = [];
   try {
@@ -201,8 +200,7 @@ function readPanel(): Panel {
     seen = lines.length;
     for (const l of lines) {
       try {
-        const t = tagOf(JSON.parse(l));
-        if (t === "rejected") rejected++; else if (t === "checked") asked++; else handled++;
+        if (tagOf(JSON.parse(l)) === "sent back") rejected++; else handled++;
       } catch { /* skip */ }
     }
     for (const l of lines.slice(-14).reverse()) {
@@ -236,8 +234,8 @@ function readPanel(): Panel {
       .split("\n").filter((l) => l.trim()).length;
   } catch { /* not reflected yet */ }
   return {
-    watching, repos: repos.size, learned, reactions, overrides, seen, handled, asked, rejected,
-    interceptRate: seen ? Math.round((100 * (asked + rejected)) / seen) : 0, sentBack, recent,
+    watching, repos: repos.size, learned, reactions, overrides, seen, handled, rejected,
+    interceptRate: seen ? Math.round((100 * rejected) / seen) : 0, sentBack, recent,
   };
 }
 
@@ -392,13 +390,13 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
 
       <div class="lead">What your double did for you</div>
       <div class="cards">
-        <div class="card"><div class="num pos" id="handled">0</div><div class="clbl">handled<br>without asking</div></div>
-        <div class="card"><div class="num amber" id="asked">0</div><div class="clbl">checked<br>with you</div></div>
-        <div class="card"><div class="num red" id="rejected">0</div><div class="clbl">rejected<br>&amp; re-asked</div></div>
+        <div class="card"><div class="num pos" id="handled">0</div><div class="clbl">let through<br>for you</div></div>
+        <div class="card"><div class="num red" id="rejected">0</div><div class="clbl">sent back<br>to the AI</div></div>
       </div>
-      <div class="sub">When Claude changes code, your double <b>steers it toward what you prefer</b>, and on each action
-        decides: <b>let it through</b>, <b>pause and ask you</b>, or <b>reject &amp; send it back to redo</b> —
-        learned from how you've accepted, edited, or reverted before. It infers from what you do; you never label anything.
+      <div class="sub">The double watches your conversation with the AI and acts <b>on your behalf, toward the AI</b> —
+        it <b>steers</b> the AI toward what you prefer, lets good changes <b>through</b>, or <b>sends the AI back to redo</b>
+        ones you'd reject. You only ever talk to the AI; the double never interrupts you. It learns from how you accept,
+        edit, and revert — no labelling.
         <i>(Acting requires enforce mode — otherwise these are what it <b>would</b> do.)</i></div>
 
       <div id="sb">
@@ -414,18 +412,18 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       </div>
 
       <div id="has">
-        <h4>How often it interrupts you</h4>
+        <h4>How often it stepped in</h4>
         <div class="metric" id="rate">0%</div>
-        <div class="sub">share of Claude's actions it paused on. This should fall as it learns your taste.</div>
+        <div class="sub">share of the AI's actions it sent back on your behalf. Should fall as it learns your taste.</div>
 
         <h4>Recently inferred</h4>
         <ul id="recent"></ul>
       </div>
 
       <div id="none" class="empty">
-        Your double is watching, but hasn't weighed in on a Claude action yet. As you use Claude
-        (with the gateway on), every edit/command it sees shows up here as <b>handled</b> or
-        <b>checked</b>, along with what it inferred you'd want.
+        Your double is watching your AI conversation, but hasn't acted on an AI action yet. As you
+        use the AI (with the gateway on), each edit/command it sees shows up here as <b>let through</b>
+        or <b>sent back to the AI</b>, along with what it inferred you'd want — you're never interrupted.
       </div>
 
       <button id="report">Open report ▸</button>
@@ -441,7 +439,6 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
           $('state').textContent=s.enabled?'watching':'paused';
           $('sess').textContent=(s.session||0)+' captured this session';
           $('handled').textContent=s.handled||0;
-          $('asked').textContent=s.asked||0;
           $('rejected').textContent=s.rejected||0;
           $('sb').style.display=(s.sentBack&&s.sentBack.length)?'block':'none';
           $('sentback').innerHTML=(s.sentBack||[]).map(o=>
@@ -452,7 +449,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
           $('none').style.display=seen?'none':'block';
           $('rate').textContent=(s.interceptRate||0)+'%';
           $('rate').className='metric '+((s.interceptRate||0)>30?'amber':'pos');
-          const TAGC={rejected:'tag red',checked:'tag amber',handled:'tag green'};
+          const TAGC={'sent back':'tag red',handled:'tag green'};
           $('recent').innerHTML=(s.recent||[]).map(r=>{
             const tag='<span class="'+(TAGC[r.tag]||'tag green')+'">'+(r.tag||'handled')+'</span>';
             const inf=r.resolution?('you usually \\u2192 '+r.resolution):(r.n?'weak precedent':'no precedent yet');

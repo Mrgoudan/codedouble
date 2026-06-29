@@ -271,9 +271,10 @@ def _quality_check(intent, proposed):
 
 
 def _capture_reply(log_path, tool, target, ran):
-    """The double asked/denied on this action and it has now completed — record the
-    user's REPLY as the gold signal: ANSWERED if they kept the flagged action (also
-    tells the double it over-intervened), OVERRIDE if they redid it differently."""
+    """The double sent the AI back on this action and it has now completed — record the
+    OUTCOME as a high-quality signal (you only ever talk to the AI): ANSWERED if the
+    action stuck unchanged (the double over-intervened -> weaken that rule), OVERRIDE if
+    it was redone differently (the redo is the true intent)."""
     if not target:
         return
     dpath = os.path.join(os.path.dirname(log_path) or ".", "decisions.jsonl")
@@ -413,18 +414,17 @@ def cmd_hook(args):
             # (observe & learn). This is the calibration thesis: act on evidence, not ignorance.
             known_bad = dec.risk >= 0.5 and dec.risk_coverage >= 0.35 and bool(dec.resolution)
             if enforce:
+                # The double acts on your behalf TOWARD THE AI — it never prompts you
+                # (you only talk to the AI). Known-bad -> send the AI back with your fix;
+                # otherwise let it through.
                 if known_bad:
                     after = dec.resolution    # the specific thing you did instead (pinpoint)
-                    if os.environ.get("CODEDOUBLE_ASK") == "1":
-                        verdict = "ask"
-                        reason = (f"[codedouble] You've corrected this kind of change before "
-                                  f"({int(dec.risk * 100)}% of similar cases). Consider: {after}")
-                    else:
-                        verdict = "deny"      # send back with the pinpointed fix
-                        reason = (f"[codedouble] You've overridden this pattern before "
-                                  f"({int(dec.risk * 100)}% of similar cases). Do this instead: {after}")
+                    verdict = "deny"          # send the AI back to redo, on your behalf
+                    reason = (f"[codedouble] (on the developer's behalf) they've corrected this "
+                              f"pattern before in {int(dec.risk * 100)}% of similar cases — "
+                              f"do this instead: {after}")
                 else:
-                    verdict = "allow"         # unknown or known-good -> don't interrupt
+                    verdict = "allow"         # unknown or known-good -> let it through
             # Optional quality gate (opt-in, Edit/Write only): if the proposed change
             # doesn't meet the intent, reject + paraphrase + send it back to redo.
             if (enforce and verdict == "allow" and tool in ("Edit", "Write")
