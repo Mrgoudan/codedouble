@@ -307,15 +307,15 @@ def cmd_hook(args):
             verdict, reason, after = "shadow", f"[codedouble] {dec.rationale}", ""
             if enforce:
                 if dec.action is Action.ASK:
-                    # default: surface for your approval (re-ask). Hard-deny is opt-in
-                    # (CODEDOUBLE_DENY=1) so cold-start doesn't block your whole workflow.
-                    if rev == "high" and os.environ.get("CODEDOUBLE_DENY") == "1":
-                        verdict = "deny"      # reject & send back to redo
-                        after = ("Redo it more safely (smaller / reversible), or rerun if it's intended."
-                                 if not dec.resolution else f"You usually prefer: {dec.resolution}")
+                    # default: SEND BACK hard-to-undo, under-determined actions (reject &
+                    # redo). Soften to surface-for-approval with CODEDOUBLE_ASK=1.
+                    if rev == "high" and os.environ.get("CODEDOUBLE_ASK") != "1":
+                        verdict = "deny"      # reject & send back to redo (DEFAULT)
+                        after = (f"You usually prefer: {dec.resolution}" if dec.resolution
+                                 else "Redo it more safely (smaller / reversible), or rerun if it's intended.")
                         reason = f"[codedouble] Hard to undo and no clear precedent you wanted it — {after}"
                     else:
-                        verdict = "ask"       # check with you (you can approve)
+                        verdict = "ask"       # CODEDOUBLE_ASK=1, or low-reversibility
                         reason = (f"[codedouble] Under-determined; you've sometimes preferred "
                                   f"'{dec.resolution}' here." if dec.resolution
                                   else "[codedouble] Hard-to-undo / under-determined — confirm this one.")
