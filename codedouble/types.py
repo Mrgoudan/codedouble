@@ -80,11 +80,13 @@ class Reversibility(enum.Enum):
 # the signal that produced its (endorsed) resolution was.
 LABEL_QUALITY = {
     Outcome.ANSWERED: 3.0,
-    Outcome.CONFIRMED_GOOD: 2.0,
-    Outcome.OVERRIDE: 1.5,        # the correction reveals the true Y — solid
+    Outcome.CONFIRMED_GOOD: 2.0,    # survived long without a negative (reflect layer 2)
+    Outcome.OVERRIDE: 1.5,          # the correction reveals the true Y — solid
     Outcome.REVERT: 1.0,
     Outcome.INTERRUPT: 1.0,
-    Outcome.ACCEPTED_SILENT: 0.5,  # weak positive
+    Outcome.ACCEPTED_SILENT: 0.5,   # survived short idle (reflect layer 1) — weak positive
+    Outcome.PENDING: 0.0,           # awaiting judgement — contributes nothing yet
+    Outcome.NEVER_VIEWED: 0.0,      # zero signal
 }
 
 

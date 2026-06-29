@@ -20,6 +20,69 @@ from .index import Calibrator, ResolutionIndex
 from .types import Action, Decision, Outcome, is_positive
 
 
+def reflect_log(raw, now, idle_fast, idle_good, extractor, min_promote=3):
+    """Survival-time *layered* reflection on the real interaction log — no commits
+    needed. Un-reacted changes are tiered by how long they've lived untouched:
+
+        age < idle_fast            -> pending           (too soon to trust)
+        idle_fast <= age < idle_good -> accepted_silent (mostly good)
+        age >= idle_good           -> confirmed_good    (survived long -> better)
+
+    A later override/revert on the same file supersedes it (stays pending). Then
+    distil stable (coarse-key -> resolution) patterns into general rules, and
+    coarse-key -> avoid for repeatedly-corrected patterns. Idempotent (recomputed
+    from timestamps), so it can run every idle tick and progressively generalise.
+    Returns (updated_records, rules, tier_counts)."""
+    from .logger import moment_of
+    NEG = {"override", "revert", "interrupt"}
+    neg_ts = defaultdict(list)                      # cheap reaction attribution by file
+    for r in raw:
+        if r.get("outcome") in NEG:
+            for f in (r.get("files") or []):
+                neg_ts[f].append(r.get("ts", 0))
+
+    tiers: dict = defaultdict(int)
+    updated = []
+    for r in raw:
+        oc = r.get("outcome")
+        if oc in NEG or oc == "answered":          # explicit signals stay as-is
+            tiers[oc] += 1; updated.append(r); continue
+        ts = r.get("ts", 0); age = now - ts
+        superseded = any(any(t > ts for t in neg_ts.get(f, [])) for f in (r.get("files") or []))
+        if superseded or age < idle_fast:
+            new = "pending"
+        elif age < idle_good:
+            new = "accepted_silent"
+        else:
+            new = "confirmed_good"
+        if new != oc:
+            r = dict(r); r["outcome"] = new
+        tiers[new] += 1
+        updated.append(r)
+
+    # distillation: compress + generalise to coarse-key rules
+    pos = defaultdict(lambda: defaultdict(float))
+    neg = defaultdict(float)
+    for r in updated:
+        oc = r.get("outcome")
+        key = extractor.extract(moment_of(r)).coarse_key()
+        if oc in ("confirmed_good", "answered"):
+            pos[key][r.get("resolution", "")] += 2.0
+        elif oc in ("accepted_silent", "override"):
+            pos[key][r.get("resolution", "")] += 1.0
+        if oc in NEG:
+            neg[key] += 1.0
+    rules = []
+    for key, resw in pos.items():
+        res, support = max(resw.items(), key=lambda kv: kv[1])
+        if support >= min_promote and res:
+            rules.append({"key": list(key), "prefer": res, "support": round(support, 1)})
+    for key, w in neg.items():
+        if w >= min_promote:
+            rules.append({"key": list(key), "avoid": True, "support": round(w, 1)})
+    return updated, rules, dict(tiers)
+
+
 def credit_assign(
     records: List[Tuple[Decision, Outcome, Optional[bool]]],
     session_outcome: str,

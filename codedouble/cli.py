@@ -159,9 +159,12 @@ def _cached_index(log_path, raw, ext):
     d = os.path.dirname(log_path) or "."
     cache = os.path.join(d, "index.cache.jsonl")
     meta = cache + ".n"
-    n = len(raw)
+    try:                                            # mtime key -> appends AND reflect rewrites invalidate
+        key = str(os.path.getmtime(log_path))
+    except OSError:
+        key = str(len(raw))
     try:
-        if os.path.exists(cache) and os.path.exists(meta) and open(meta).read().strip() == str(n):
+        if os.path.exists(cache) and os.path.exists(meta) and open(meta).read().strip() == key:
             return ResolutionIndex.load(cache)
     except Exception:
         pass
@@ -171,7 +174,7 @@ def _cached_index(log_path, raw, ext):
         idx.save(tmp)
         os.replace(tmp, cache)
         with open(meta, "w") as f:
-            f.write(str(n))
+            f.write(key)
     except Exception:
         pass
     return idx
@@ -381,6 +384,34 @@ def cmd_hook(args):
         return  # fail-open: never block the user's session
 
 
+def cmd_reflect(args):
+    """Layered, survival-time reflection (README §6) — off the hot path. Tiers
+    un-reacted changes by how long they've survived (mostly-good -> confirmed),
+    then distils stable patterns into general rules. Idempotent; run on idle."""
+    from .reflect import reflect_log
+    raw = EventLog(args.log).read()
+    if not raw:
+        if not args.quiet:
+            print("nothing to reflect yet")
+        return
+    ext = RuleBasedExtractor(HashingEmbedder(256))
+    updated, rules, tiers = reflect_log(
+        raw, time.time(), args.idle_fast, args.idle_good, ext, args.min_promote)
+    d = os.path.dirname(args.log) or "."
+    tmp = args.log + ".tmp"
+    with open(tmp, "w") as f:
+        for r in updated:
+            f.write(json.dumps(r) + "\n")
+    os.replace(tmp, args.log)
+    rpath = os.path.join(d, "rules.jsonl")
+    with open(rpath, "w") as f:
+        for rr in rules:
+            f.write(json.dumps(rr) + "\n")
+    if not args.quiet:
+        print("reflected (tiers):", dict(tiers))
+        print(f"distilled {len(rules)} rule(s) -> {rpath}")
+
+
 def cmd_models(args):
     """List local Ollama models the user can pick for the reasoning slot."""
     from .backends import list_ollama_models
@@ -449,6 +480,14 @@ def main(argv=None):
 
     p = sub.add_parser("install-hook"); p.add_argument("--repo", default=".")
     p.set_defaults(func=lambda a: install_hook(a.repo))
+
+    p = sub.add_parser("reflect", help="layered survival-time reflection + distil rules (run on idle)")
+    p.add_argument("--idle-fast", dest="idle_fast", type=float, default=1800,
+                   help="age(s) after which an un-reacted change is 'mostly good' (default 30m)")
+    p.add_argument("--idle-good", dest="idle_good", type=float, default=86400,
+                   help="age(s) after which it's 'confirmed good' (default 1d)")
+    p.add_argument("--min-promote", dest="min_promote", type=int, default=3)
+    p.add_argument("--quiet", action="store_true"); p.set_defaults(func=cmd_reflect)
 
     p = sub.add_parser("models", help="list local ollama models you can pick for reasoning")
     p.set_defaults(func=cmd_models)

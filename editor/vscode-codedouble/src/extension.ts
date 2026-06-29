@@ -5,6 +5,7 @@
 // Nothing here asks you to label anything — it learns from what you do.
 //   analysis/visualization:  codedouble report
 
+import * as cp from "child_process";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -21,6 +22,8 @@ interface Proposal {
 
 const pending = new Map<string, Proposal[]>();
 let sessionCount = 0;
+let lastActivity = Date.now();
+let lastReflect = 0;
 let statusBar: vscode.StatusBarItem;
 let view: CodeDoubleView | undefined;
 let flashDeco: vscode.TextEditorDecorationType;
@@ -122,6 +125,7 @@ function record(
     return;
   }
   sessionCount++;
+  lastActivity = Date.now();
   updateStatus();
   view?.refresh();
   if (flashRange) flash(doc, flashRange.start, flashRange.end);
@@ -135,6 +139,7 @@ function decisionsPath(): string {
 interface Panel {
   watching: number;   // interactions captured passively (all repos)
   repos: number;
+  learned: number;    // distilled preference rules (from reflection)
   reactions: Array<{ k: string; v: number }>;                 // your reactions, by kind
   overrides: Array<{ file: string; from: string; to: string; rel: string }>;  // override detail
   seen: number;       // Claude actions the double weighed in on
@@ -225,8 +230,13 @@ function readPanel(): Panel {
       } catch { /* skip */ }
     }
   } catch { /* gateway not active yet */ }
+  let learned = 0;
+  try {
+    learned = fs.readFileSync(path.join(path.dirname(logPath()), "rules.jsonl"), "utf8")
+      .split("\n").filter((l) => l.trim()).length;
+  } catch { /* not reflected yet */ }
   return {
-    watching, repos: repos.size, reactions, overrides, seen, handled, asked, rejected,
+    watching, repos: repos.size, learned, reactions, overrides, seen, handled, asked, rejected,
     interceptRate: seen ? Math.round((100 * (asked + rejected)) / seen) : 0, sentBack, recent,
   };
 }
@@ -467,7 +477,9 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
             '<div class="inf">'+(o.from?('AI: '+o.from+' \\u2192 you: '+(o.to||'?')):('you wrote: '+(o.to||'?')))+'</div></li>').join('')
             ||'<li class="inf">no overrides yet — when you edit an AI change, the before\\u2192after appears here</li>';
           $('foot').textContent='Watching '+(s.watching||0)+' interactions'+
-            (s.repos>1?(' across '+s.repos+' repos'):'')+' — passively, no buttons. '+(s.store||'~/.codedouble');
+            (s.repos>1?(' across '+s.repos+' repos'):'')+
+            (s.learned?(' · learned '+s.learned+' rule'+(s.learned>1?'s':'')):'')+
+            ' — passively. '+(s.store||'~/.codedouble');
         });
       </script></body></html>`;
   }
@@ -521,6 +533,18 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.setStatusBarMessage(`CodeDouble ${next ? "watching" : "paused"}`, 2500);
     })
   );
+
+  // Layered reflection, OFF the hot path: after ~5 min of no captures, run the
+  // survival-time reflection (tiers mostly-good/confirmed by how long changes
+  // survived, distils rules). Idempotent, so re-running just generalises more.
+  const idleTimer = setInterval(() => {
+    if (!cfg<boolean>("enabled", true)) return;
+    if (Date.now() - lastActivity < 5 * 60 * 1000) return;   // still active
+    if (lastActivity <= lastReflect) return;                 // nothing new since last reflect
+    lastReflect = Date.now();
+    cp.exec("python3 -m codedouble.cli reflect --quiet", { timeout: 60000 }, () => view?.refresh());
+  }, 60 * 1000);
+  context.subscriptions.push({ dispose: () => clearInterval(idleTimer) });
 }
 
 export function deactivate(): void {
