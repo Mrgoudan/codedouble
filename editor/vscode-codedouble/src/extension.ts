@@ -48,6 +48,26 @@ const LANG: Record<string, string> = {
   cpp: "cpp", ruby: "ruby", php: "php", csharp: "csharp",
 };
 
+// Don't capture machine-written files (logs/data) or build/vendor dirs — external
+// processes (e.g. an AI loop appending to loop.log) are not you editing AI code.
+const IGNORE_EXT = new Set([
+  ".log", ".jsonl", ".tmp", ".temp", ".lock", ".map", ".csv", ".tsv",
+  ".out", ".pyc", ".bin", ".cache", ".pid", ".sqlite", ".db",
+]);
+const IGNORE_DIR = [
+  "/node_modules/", "/.git/", "/dist/", "/build/", "/out/", "/.codedouble/",
+  "/__pycache__/", "/.venv/", "/venv/", "/.next/", "/target/", "/.cache/", "/logs/",
+];
+
+function isCapturable(doc: vscode.TextDocument): boolean {
+  if (doc.uri.scheme !== "file") return false;
+  const p = doc.uri.fsPath.toLowerCase();
+  if (IGNORE_DIR.some((d) => p.includes(d))) return false;
+  if (IGNORE_EXT.has(path.extname(p))) return false;
+  if (p.endsWith(".log") || /\.log\.\d+$/.test(p)) return false;   // foo.log, foo.log.1
+  return true;
+}
+
 function firstLine(text: string): string {
   for (const ln of text.split("\n")) { const t = ln.trim(); if (t) return t.slice(0, 80); }
   return text.trim().slice(0, 80);

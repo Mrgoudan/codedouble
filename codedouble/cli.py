@@ -182,6 +182,49 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict=""):
         pass
 
 
+_QC_SYSTEM = (
+    "You are a strict reviewer of an AI's proposed code change. Given the developer's "
+    "intent and the proposed change, decide if it adequately and correctly fulfills the "
+    "intent. Return ONLY JSON: {\"ok\": true} if it is good enough, or "
+    "{\"ok\": false, \"refine\": \"<one concise, specific instruction telling the AI how to "
+    "redo it better>\"} if it is not."
+)
+
+
+def _last_prompt(log_path):
+    """The most recent user prompt the gateway saw (the real intent for QC)."""
+    p = os.path.join(os.path.dirname(log_path) or ".", "decisions.jsonl")
+    last = ""
+    try:
+        with open(p) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    if r.get("event") == "UserPromptSubmit" and r.get("intent"):
+                        last = r["intent"]
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return last
+
+
+def _quality_check(intent, proposed):
+    """Ask the LOCAL model whether the change meets the intent. Returns
+    (ok, refine). Fail-open: any error -> ok=True (never block on QC failure)."""
+    try:
+        from .backends import OllamaClient
+        client = OllamaClient(model=resolve_ollama_model(None), timeout=40)
+        out = client.chat(
+            f"Intent:\n{intent}\n\nProposed change:\n{proposed[:2000]}",
+            system=_QC_SYSTEM, json_mode=True,
+        )
+        data = json.loads(out)
+        return bool(data.get("ok", True)), str(data.get("refine", ""))[:200]
+    except Exception:
+        return True, ""
+
+
 def cmd_gate(args):
     """The gateway decision: read an intent (JSON on stdin), emit a decision JSON.
     Used for BOTH directions: intake -> use `inject`; outtake -> use `allow`/`ask`."""
@@ -271,6 +314,17 @@ def cmd_hook(args):
                               else "[codedouble] Under-determined — worth a quick check.")
                 else:
                     verdict = "allow"         # handled for you
+            # Optional quality gate (opt-in, Edit/Write only): if the proposed change
+            # doesn't meet the intent, reject + paraphrase + send it back to redo.
+            if (enforce and verdict == "allow" and tool in ("Edit", "Write")
+                    and os.environ.get("CODEDOUBLE_QC") == "1"):
+                proposed = str(ti.get("new_string") or ti.get("content") or "")
+                if proposed.strip():
+                    ok, refine = _quality_check(_last_prompt(args.log) or payload["request"], proposed)
+                    if not ok:
+                        verdict = "deny"
+                        reason = ("[codedouble] quality check — this doesn't fully meet the intent. "
+                                  + (refine or "Redo it to match what was asked, more carefully."))
             _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"], verdict=verdict)
             if enforce:
                 print(json.dumps({"hookSpecificOutput": {
