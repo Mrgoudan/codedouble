@@ -25,6 +25,7 @@ from .types import (
     PreferenceRule,
     ResolutionEvent,
     Signature,
+    Source,
     is_negative,
 )
 
@@ -225,3 +226,33 @@ class ResolutionIndex:
                     )
                     + "\n"
                 )
+
+    @classmethod
+    def load(cls, path: str) -> "ResolutionIndex":
+        """Reconstruct an index (with embeddings) from a save() file — so the hot
+        path can reuse cached vectors instead of re-embedding the whole log."""
+        idx = cls()
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                s = d["sig"]
+                cv = s.get("code_vec")
+                iv = s.get("intent_vec")
+                sig = Signature(
+                    lang=s["lang"], repo=s["repo"], error_type=s["error_type"],
+                    action_kind=s["action_kind"], phrasing_class=s["phrasing_class"],
+                    files=tuple(s.get("files", ())), symbols=tuple(s.get("symbols", ())),
+                    code_vec=np.asarray(cv, dtype=np.float32) if cv else None,
+                    intent_vec=np.asarray(iv, dtype=np.float32) if iv else None,
+                    raw_request=s.get("raw_request", ""), raw_diff=s.get("raw_diff", ""),
+                )
+                idx.add(ResolutionEvent(
+                    id=d["id"], ts=d["ts"], signature=sig, resolution=d["resolution"],
+                    outcome=Outcome(d["outcome"]), source=Source(d["source"]),
+                    confidence_at_decision=d["confidence_at_decision"],
+                    corrected_from=d.get("corrected_from"), session_id=d.get("session_id"),
+                ))
+        return idx

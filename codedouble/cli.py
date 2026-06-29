@@ -152,13 +152,38 @@ def cmd_on(args):
     print("  python3 -m codedouble.cli report")
 
 
+def _cached_index(log_path, raw, ext):
+    """Load a cached index (with vectors) when interactions are unchanged; else
+    rebuild + persist. Avoids re-embedding the whole log on every hook call (#5)."""
+    from .index import ResolutionIndex
+    d = os.path.dirname(log_path) or "."
+    cache = os.path.join(d, "index.cache.jsonl")
+    meta = cache + ".n"
+    n = len(raw)
+    try:
+        if os.path.exists(cache) and os.path.exists(meta) and open(meta).read().strip() == str(n):
+            return ResolutionIndex.load(cache)
+    except Exception:
+        pass
+    idx = build_index(raw, ext)
+    try:
+        tmp = cache + ".tmp"
+        idx.save(tmp)
+        os.replace(tmp, cache)
+        with open(meta, "w") as f:
+            f.write(str(n))
+    except Exception:
+        pass
+    return idx
+
+
 def _decide(log_path, payload, conf):
-    """Run one gateway decision (fast: hashing embedder, no model load)."""
+    """Run one gateway decision (fast: hashing embedder, cached index)."""
     from .double import Double
     from .types import Reversibility
     raw = EventLog(log_path).read()
     ext = RuleBasedExtractor(HashingEmbedder(256))
-    double = Double(ext, build_index(raw, ext), conf_threshold=conf)
+    double = Double(ext, _cached_index(log_path, raw, ext), conf_threshold=conf)
     double.now = float(len(raw) + 1)
     rev = Reversibility.HIGH if payload.get("reversibility") == "high" else Reversibility.LOW
     return double.resolve(moment_of(payload), rev)
@@ -166,9 +191,10 @@ def _decide(log_path, payload, conf):
 
 def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after=""):
     d = os.path.dirname(log_path) or "."
+    path = os.path.join(d, "decisions.jsonl")
     try:
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "decisions.jsonl"), "a") as f:
+        with open(path, "a") as f:
             f.write(json.dumps({
                 "ts": time.time(), "event": event, "tool": tool,
                 "intent": (intent or "").strip()[:140],
@@ -180,6 +206,14 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", be
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
                 "n": len(dec.retrieved), "enforce": enforce,
             }) + "\n")
+        # cap growth (#6): cheap stat each call, rewrite only when over the cap
+        if os.path.getsize(path) > 1_500_000:
+            with open(path) as f:
+                tail = f.readlines()[-1500:]
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                f.writelines(tail)
+            os.replace(tmp, path)
     except Exception:
         pass
 
@@ -199,13 +233,14 @@ def _last_prompt(log_path):
     last = ""
     try:
         with open(p) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    if r.get("event") == "UserPromptSubmit" and r.get("intent"):
-                        last = r["intent"]
-                except Exception:
-                    pass
+            lines = f.readlines()[-800:]          # tail only — don't scan the whole log
+        for line in lines:
+            try:
+                r = json.loads(line)
+                if r.get("event") == "UserPromptSubmit" and r.get("intent"):
+                    last = r["intent"]
+            except Exception:
+                pass
     except Exception:
         pass
     return last
