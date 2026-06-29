@@ -164,7 +164,7 @@ def _decide(log_path, payload, conf):
     return double.resolve(moment_of(payload), rev)
 
 
-def _log_decision(log_path, event, tool, dec, enforce, intent=""):
+def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict=""):
     d = os.path.dirname(log_path) or "."
     try:
         os.makedirs(d, exist_ok=True)
@@ -173,6 +173,7 @@ def _log_decision(log_path, event, tool, dec, enforce, intent=""):
                 "ts": time.time(), "event": event, "tool": tool,
                 "intent": (intent or "").strip()[:140],
                 "resolution": (dec.resolution or "").strip()[:140],
+                "verdict": verdict,            # inject | allow | ask | deny | shadow | watch
                 "action": dec.action.value, "ask": dec.action.value == "ask",
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
                 "n": len(dec.retrieved), "enforce": enforce,
@@ -231,11 +232,14 @@ def cmd_hook(args):
         if name == "UserPromptSubmit":
             prompt = ev.get("prompt", "")
             dec = _decide(args.log, {"request": prompt, "reversibility": "low"}, args.conf)
-            _log_decision(args.log, name, None, dec, enforce, intent=prompt)
-            if dec.retrieved and dec.confidence >= 0.4:
-                ctx = (f"[codedouble] For this kind of request you've previously preferred "
-                       f"'{dec.resolution}' ({len(dec.retrieved)} similar past decisions, "
-                       f"confidence {dec.confidence:.2f}). Use it unless this case differs.")
+            injected = bool(dec.retrieved and dec.confidence >= 0.4 and dec.resolution)
+            _log_decision(args.log, name, None, dec, enforce, intent=prompt,
+                          verdict=("inject" if injected else "watch"))
+            if injected:
+                # steer the input toward what the developer has consistently preferred
+                ctx = (f"[codedouble] The developer has consistently preferred '{dec.resolution}' "
+                       f"for this kind of request ({len(dec.retrieved)} precedents, "
+                       f"confidence {dec.confidence:.2f}). Apply that approach unless this case clearly differs.")
                 print(json.dumps({"hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit", "additionalContext": ctx}}))
             return
@@ -254,12 +258,25 @@ def cmd_hook(args):
                 "reversibility": rev,
             }
             dec = _decide(args.log, payload, args.conf)
-            _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"])
+            verdict, reason = "shadow", f"[codedouble] {dec.rationale}"
             if enforce:
-                pd = "ask" if dec.action is Action.ASK else "allow"
+                if dec.action is Action.ASK and rev == "high":
+                    verdict = "deny"          # reject & re-ask: hard to undo + under-determined
+                    reason = ("[codedouble] This is hard to undo and I have no clear precedent that "
+                              "you wanted it. Redo it more safely, or rerun if it's intended.")
+                elif dec.action is Action.ASK:
+                    verdict = "ask"           # check with you
+                    reason = (f"[codedouble] Under-determined; you've sometimes preferred "
+                              f"'{dec.resolution}' here." if dec.resolution
+                              else "[codedouble] Under-determined — worth a quick check.")
+                else:
+                    verdict = "allow"         # handled for you
+            _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"], verdict=verdict)
+            if enforce:
                 print(json.dumps({"hookSpecificOutput": {
-                    "hookEventName": "PreToolUse", "permissionDecision": pd,
-                    "permissionDecisionReason": f"[codedouble] {dec.rationale}"}}))
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": ("deny" if verdict == "deny" else verdict),
+                    "permissionDecisionReason": reason}}))
             return  # shadow: emit nothing -> normal flow
     except Exception:
         return  # fail-open: never block the user's session

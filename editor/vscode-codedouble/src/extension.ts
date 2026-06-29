@@ -120,8 +120,9 @@ interface Panel {
   seen: number;       // Claude actions the double weighed in on
   handled: number;    // let through without interrupting you
   asked: number;      // paused to check with you
+  rejected: number;   // rejected & sent back to redo
   interceptRate: number;
-  recent: Array<{ intent: string; resolution: string; asked: boolean; conf: number; n: number; rel: string }>;
+  recent: Array<{ intent: string; resolution: string; tag: string; conf: number; n: number; rel: string }>;
 }
 
 function shortIntent(s: string): string {
@@ -157,27 +158,40 @@ function readPanel(): Panel {
     }
   } catch { /* none yet */ }
   const reactions = Object.entries(rcounts).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ k, v }));
-  // the double's act-vs-ask decisions on your real Claude usage (decisions.jsonl)
-  let seen = 0, handled = 0, asked = 0;
+  // the double's verdicts on your real Claude usage (decisions.jsonl)
+  // verdict: inject/allow = handled, ask = checked, deny = rejected (shadow falls back to would-ask)
+  const tagOf = (r: Record<string, unknown>): string => {
+    const v = r.verdict as string | undefined;
+    if (v === "deny") return "rejected";
+    if (v === "ask") return "checked";
+    if (v === undefined || v === "shadow") return r.ask ? "checked" : "handled";
+    return "handled"; // inject | allow | watch
+  };
+  let seen = 0, handled = 0, asked = 0, rejected = 0;
   const recent: Panel["recent"] = [];
   try {
     const lines = fs.readFileSync(decisionsPath(), "utf8").split("\n").filter((l) => l.trim());
     seen = lines.length;
-    for (const l of lines) { try { const r = JSON.parse(l); if (r.ask) asked++; else handled++; } catch { /* skip */ } }
+    for (const l of lines) {
+      try {
+        const t = tagOf(JSON.parse(l));
+        if (t === "rejected") rejected++; else if (t === "checked") asked++; else handled++;
+      } catch { /* skip */ }
+    }
     for (const l of lines.slice(-14).reverse()) {
       try {
         const r = JSON.parse(l);
         recent.push({
           intent: shortIntent(r.intent || r.tool || r.event || "decision"),
           resolution: shortIntent(r.resolution || ""),
-          asked: !!r.ask, conf: r.confidence || 0, n: r.n || 0, rel: relTime(r.ts || 0),
+          tag: tagOf(r), conf: r.confidence || 0, n: r.n || 0, rel: relTime(r.ts || 0),
         });
       } catch { /* skip */ }
     }
   } catch { /* gateway not active yet */ }
   return {
-    watching, repos: repos.size, reactions, overrides, seen, handled, asked,
-    interceptRate: seen ? Math.round((100 * asked) / seen) : 0, recent,
+    watching, repos: repos.size, reactions, overrides, seen, handled, asked, rejected,
+    interceptRate: seen ? Math.round((100 * (asked + rejected)) / seen) : 0, recent,
   };
 }
 
@@ -193,8 +207,18 @@ function finalizeAccepted(key: string, p: Proposal, doc: vscode.TextDocument): v
   if (p.timer) clearTimeout(p.timer);
   const arr = pending.get(key);
   if (arr) pending.set(key, arr.filter((x) => x !== p));
-  record(doc, p.viewed ? "accepted_silent" : "never_viewed", firstLine(p.text), null,
-    p.text, "edit", { start: p.startLine, end: p.endLine });
+  if (p.viewed) {
+    record(doc, "accepted_silent", firstLine(p.text), null, p.text, "edit",
+      { start: p.startLine, end: p.endLine });
+    return;
+  }
+  // Not viewed: only record if it's a clearly large block (AI-like). Small unviewed
+  // inserts are usually your own typing/paste — skipping them cuts never_viewed noise.
+  const lines = p.endLine - p.startLine + 1;
+  if (lines >= Math.max(8, cfg<number>("minInsertLines", 3) * 3)) {
+    record(doc, "never_viewed", firstLine(p.text), null, p.text, "edit",
+      { start: p.startLine, end: p.endLine });
+  }
 }
 
 function onChange(e: vscode.TextDocumentChangeEvent): void {
@@ -293,7 +317,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .lead{font-weight:600;margin-top:12px}
       .cards{display:flex;gap:8px;margin-top:7px}
       .card{flex:1;background:var(--vscode-input-background,#80808022);border-radius:7px;padding:9px 6px;text-align:center}
-      .num{font-size:25px;font-weight:700;line-height:1}.num.pos{color:#3fb950}.num.amber{color:#d29922}
+      .num{font-size:23px;font-weight:700;line-height:1}.num.pos{color:#3fb950}.num.amber{color:#d29922}.num.red{color:#f85149}
       .clbl{font-size:10px;opacity:.72;margin-top:5px;line-height:1.25}
       h4{margin:15px 0 4px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;opacity:.55}
       .metric{font-size:23px;font-weight:700}
@@ -304,7 +328,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .iv{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .inf{opacity:.62;font-size:11px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       .tag{font-size:9px;text-transform:uppercase;letter-spacing:.03em;padding:1px 6px;border-radius:9px;color:#fff;flex:none}
-      .tag.green{background:#3fb950}.tag.amber{background:#d29922}
+      .tag.green{background:#3fb950}.tag.amber{background:#d29922}.tag.red{background:#f85149}
       .t{opacity:.7}
       .rx{margin:7px 0}.rxh{display:flex;align-items:center;gap:6px}
       .rdot{width:8px;height:8px;border-radius:50%;flex:none}
@@ -322,10 +346,12 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       <div class="cards">
         <div class="card"><div class="num pos" id="handled">0</div><div class="clbl">handled<br>without asking</div></div>
         <div class="card"><div class="num amber" id="asked">0</div><div class="clbl">checked<br>with you</div></div>
+        <div class="card"><div class="num red" id="rejected">0</div><div class="clbl">rejected<br>&amp; re-asked</div></div>
       </div>
-      <div class="sub">When Claude changes code, your double decides whether to <b>let it through</b> or
-        <b>pause and ask you</b> — learned from how you've accepted, edited, or reverted changes before.
-        It infers from what you do; you never label anything.</div>
+      <div class="sub">When Claude changes code, your double <b>steers it toward what you prefer</b>, and on each action
+        decides: <b>let it through</b>, <b>pause and ask you</b>, or <b>reject &amp; send it back to redo</b> —
+        learned from how you've accepted, edited, or reverted before. It infers from what you do; you never label anything.
+        <i>(Acting requires enforce mode — otherwise these are what it <b>would</b> do.)</i></div>
 
       <div id="react">
         <h4>Your reactions to AI changes</h4>
@@ -363,13 +389,15 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
           $('sess').textContent=(s.session||0)+' captured this session';
           $('handled').textContent=s.handled||0;
           $('asked').textContent=s.asked||0;
+          $('rejected').textContent=s.rejected||0;
           const seen=s.seen||0;
           $('has').style.display=seen?'block':'none';
           $('none').style.display=seen?'none':'block';
           $('rate').textContent=(s.interceptRate||0)+'%';
           $('rate').className='metric '+((s.interceptRate||0)>30?'amber':'pos');
+          const TAGC={rejected:'tag red',checked:'tag amber',handled:'tag green'};
           $('recent').innerHTML=(s.recent||[]).map(r=>{
-            const tag=r.asked?'<span class="tag amber">checked</span>':'<span class="tag green">handled</span>';
+            const tag='<span class="'+(TAGC[r.tag]||'tag green')+'">'+(r.tag||'handled')+'</span>';
             const inf=r.resolution?('you usually \\u2192 '+r.resolution):(r.n?'weak precedent':'no precedent yet');
             const meta=(r.rel?(' \\u00b7 '+r.rel):'')+(r.conf?(' \\u00b7 '+Math.round(r.conf*100)+'%'):'');
             return '<li><div class="it">'+tag+'<span class="iv">'+r.intent+'</span></div>'+
