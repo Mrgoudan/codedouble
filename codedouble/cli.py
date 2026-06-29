@@ -28,6 +28,7 @@ from .logger import (
     EventLog,
     build_index,
     capture_git,
+    codedouble_home,
     moment_of,
     record_interaction,
     replay,
@@ -163,13 +164,15 @@ def _decide(log_path, payload, conf):
     return double.resolve(moment_of(payload), rev)
 
 
-def _log_decision(log_path, event, tool, dec, enforce):
+def _log_decision(log_path, event, tool, dec, enforce, intent=""):
     d = os.path.dirname(log_path) or "."
     try:
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, "decisions.jsonl"), "a") as f:
             f.write(json.dumps({
                 "ts": time.time(), "event": event, "tool": tool,
+                "intent": (intent or "").strip()[:140],
+                "resolution": (dec.resolution or "").strip()[:140],
                 "action": dec.action.value, "ask": dec.action.value == "ask",
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
                 "n": len(dec.retrieved), "enforce": enforce,
@@ -226,8 +229,9 @@ def cmd_hook(args):
         enforce = os.environ.get("CODEDOUBLE_ENFORCE") == "1"
 
         if name == "UserPromptSubmit":
-            dec = _decide(args.log, {"request": ev.get("prompt", ""), "reversibility": "low"}, args.conf)
-            _log_decision(args.log, name, None, dec, enforce)
+            prompt = ev.get("prompt", "")
+            dec = _decide(args.log, {"request": prompt, "reversibility": "low"}, args.conf)
+            _log_decision(args.log, name, None, dec, enforce, intent=prompt)
             if dec.retrieved and dec.confidence >= 0.4:
                 ctx = (f"[codedouble] For this kind of request you've previously preferred "
                        f"'{dec.resolution}' ({len(dec.retrieved)} similar past decisions, "
@@ -250,7 +254,7 @@ def cmd_hook(args):
                 "reversibility": rev,
             }
             dec = _decide(args.log, payload, args.conf)
-            _log_decision(args.log, name, tool, dec, enforce)
+            _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"])
             if enforce:
                 pd = "ask" if dec.action is Action.ASK else "allow"
                 print(json.dumps({"hookSpecificOutput": {
@@ -313,7 +317,8 @@ def main(argv=None):
                    help="ollama model for --backend ollama (overrides env; see `codedouble models`)")
     p.add_argument("--window", type=int, default=40)
     p.add_argument("--conf", type=float, default=0.6)
-    p.add_argument("--out", default="report.html")
+    p.add_argument("--out", default=os.path.join(codedouble_home(), "report.html"),
+                   help="where to write the HTML (default: global ~/.codedouble/report.html)")
     p.add_argument("--sim", action="store_true", help="use the simulated user")
     p.add_argument("--seed", type=int, default=7); p.set_defaults(func=cmd_report)
 

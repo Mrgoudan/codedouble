@@ -1,11 +1,9 @@
-// CodeDouble Capture — records editor interactions (accept / override / reject /
-// viewed) into the GLOBAL ~/.codedouble/interactions.jsonl (same schema + path the
-// Python CLI defaults to), so the double learns across ALL VS Code windows / repos.
-// The "CodeDouble" panel (in the Explorer) shows live, all-repo stats so you can
-// SEE it work; analysis/visualization is in Python:  codedouble report
-//
-// Capture in the editor; analysis/visualization in Python:
-//   python3 -m codedouble.cli report   (or: codedouble report)
+// CodeDouble Capture — passively records your interactions with AI changes
+// (accept / edit-over / revert / view) into the GLOBAL ~/.codedouble store, and
+// shows what your *double* did for you: which of Claude's actions it handled
+// silently vs. paused to check with you, and what it inferred you'd want.
+// Nothing here asks you to label anything — it learns from what you do.
+//   analysis/visualization:  codedouble report
 
 import * as fs from "fs";
 import * as os from "os";
@@ -31,9 +29,8 @@ function cfg<T>(key: string, dflt: T): T {
   return vscode.workspace.getConfiguration("codedouble").get<T>(key, dflt);
 }
 
-// GLOBAL, machine-wide store by default so the double learns across ALL VS Code
-// windows / repos (the original proposal). Matches the Python CLI default
-// (~/.codedouble). Override with CODEDOUBLE_LOG (file) or CODEDOUBLE_HOME (dir).
+// GLOBAL, machine-wide store by default (matches the Python CLI default,
+// ~/.codedouble). Override with CODEDOUBLE_LOG (file) or CODEDOUBLE_HOME (dir).
 function logPath(): string {
   const envLog = process.env.CODEDOUBLE_LOG;
   if (envLog) {
@@ -51,21 +48,14 @@ const LANG: Record<string, string> = {
   cpp: "cpp", ruby: "ruby", php: "php", csharp: "csharp",
 };
 
-const OUTCOME_COLOR: Record<string, string> = {
-  override: "#f85149", revert: "#f85149", interrupt: "#f85149",
-  confirmed_good: "#3fb950", answered: "#3fb950",
-  accepted_silent: "#8b949e", never_viewed: "#6e7681", pending: "#d29922",
-};
-const NEG = new Set(["override", "revert", "interrupt"]);
-
 function firstLine(text: string): string {
   for (const ln of text.split("\n")) { const t = ln.trim(); if (t) return t.slice(0, 80); }
   return text.trim().slice(0, 80);
 }
 
 function relTime(tsSec: number): string {
-  const s = Math.max(0, Date.now() / 1000 - tsSec);
   if (!tsSec) return "";
+  const s = Math.max(0, Date.now() / 1000 - tsSec);
   if (s < 60) return `${Math.floor(s)}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m`;
   if (s < 86400) return `${Math.floor(s / 3600)}h`;
@@ -117,54 +107,56 @@ function record(
   if (flashRange) flash(doc, flashRange.start, flashRange.end);
 }
 
-// ---- read all-repo stats from the global log (the panel's data) -------------
-interface Stats {
-  total: number;
-  repos: number;
-  overrideRate: number;             // % of decisions you overrode/reverted/interrupted
-  outcomes: Array<{ k: string; v: number; color: string; pct: number }>;
-  recent: Array<{ outcome: string; file: string; rel: string; neg: boolean; pos: boolean }>;
+// ---- the double's behavior (decisions) + what it's passively watching -------
+function decisionsPath(): string {
+  return path.join(path.dirname(logPath()), "decisions.jsonl");
 }
 
-function readStats(): Stats {
-  const lp = logPath();
-  const counts: Record<string, number> = {};
-  const repos = new Set<string>();
-  const recent: Stats["recent"] = [];
-  let total = 0;
+interface Panel {
+  watching: number;   // interactions captured passively (all repos)
+  repos: number;
+  seen: number;       // Claude actions the double weighed in on
+  handled: number;    // let through without interrupting you
+  asked: number;      // paused to check with you
+  interceptRate: number;
+  recent: Array<{ intent: string; resolution: string; asked: boolean; conf: number; n: number; rel: string }>;
+}
+
+function shortIntent(s: string): string {
+  s = (s || "").replace(/\s+/g, " ").trim();
+  return s.length > 72 ? s.slice(0, 71) + "…" : s;
+}
+
+function readPanel(): Panel {
+  // passive signal: how much it has watched (interactions.jsonl, all repos)
+  let watching = 0; const repos = new Set<string>();
   try {
-    const lines = fs.readFileSync(lp, "utf8").split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      total++;
-      try {
-        const r = JSON.parse(line);
-        counts[r.outcome] = (counts[r.outcome] || 0) + 1;
-        if (r.repo) repos.add(r.repo);
-      } catch { /* skip malformed */ }
+    for (const line of fs.readFileSync(logPath(), "utf8").split("\n")) {
+      if (!line.trim()) continue; watching++;
+      try { const r = JSON.parse(line); if (r.repo) repos.add(r.repo); } catch { /* skip */ }
     }
-    const tail = lines.filter((l) => l.trim()).slice(-12).reverse();
-    for (const line of tail) {
+  } catch { /* none yet */ }
+  // the double's act-vs-ask decisions on your real Claude usage (decisions.jsonl)
+  let seen = 0, handled = 0, asked = 0;
+  const recent: Panel["recent"] = [];
+  try {
+    const lines = fs.readFileSync(decisionsPath(), "utf8").split("\n").filter((l) => l.trim());
+    seen = lines.length;
+    for (const l of lines) { try { const r = JSON.parse(l); if (r.ask) asked++; else handled++; } catch { /* skip */ } }
+    for (const l of lines.slice(-14).reverse()) {
       try {
-        const r = JSON.parse(line);
-        const f = (r.files && r.files[0]) || r.request || "";
+        const r = JSON.parse(l);
         recent.push({
-          outcome: r.outcome || "?", file: String(f).split("/").pop() || String(f),
-          rel: relTime(r.ts || 0), neg: NEG.has(r.outcome),
-          pos: r.outcome === "confirmed_good" || r.outcome === "answered",
+          intent: shortIntent(r.intent || r.tool || r.event || "decision"),
+          resolution: shortIntent(r.resolution || ""),
+          asked: !!r.ask, conf: r.confidence || 0, n: r.n || 0, rel: relTime(r.ts || 0),
         });
       } catch { /* skip */ }
     }
-  } catch { /* no log yet */ }
-  const neg = Object.entries(counts).filter(([k]) => NEG.has(k)).reduce((a, [, v]) => a + v, 0);
-  const max = Math.max(1, ...Object.values(counts));
-  const outcomes = Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => ({ k, v, color: OUTCOME_COLOR[k] || "#8b949e", pct: Math.round((100 * v) / max) }));
+  } catch { /* gateway not active yet */ }
   return {
-    total, repos: repos.size,
-    overrideRate: total ? Math.round((100 * neg) / total) : 0,
-    outcomes, recent,
+    watching, repos: repos.size, seen, handled, asked,
+    interceptRate: seen ? Math.round((100 * asked) / seen) : 0, recent,
   };
 }
 
@@ -172,7 +164,7 @@ function updateStatus(): void {
   if (!statusBar) return;
   const on = cfg<boolean>("enabled", true);
   statusBar.text = `$(eye) CodeDouble ${on ? sessionCount : "off"}`;
-  statusBar.tooltip = "CodeDouble — interactions captured this session. Click to open the panel.";
+  statusBar.tooltip = "CodeDouble — interactions watched this session. Click to open the panel.";
   statusBar.show();
 }
 
@@ -249,12 +241,8 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
     v.webview.options = { enableScripts: true };
     v.webview.html = this.html();
     v.webview.onDidReceiveMessage((m) => {
-      const map: Record<string, string> = {
-        openReport: "codedouble.openReport", toggle: "codedouble.toggle",
-        accept: "codedouble.acceptReviewed", override: "codedouble.markOverride",
-        reject: "codedouble.reject",
-      };
-      if (m?.cmd && map[m.cmd]) vscode.commands.executeCommand(map[m.cmd]);
+      if (m?.cmd === "openReport") vscode.commands.executeCommand("codedouble.openReport");
+      if (m?.cmd === "toggle") vscode.commands.executeCommand("codedouble.toggle");
     });
     v.onDidChangeVisibility(() => { if (v.visible) this.refresh(); });
     this.refresh();
@@ -267,7 +255,8 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
     this.wv.webview.postMessage({
       enabled: cfg<boolean>("enabled", true),
       session: sessionCount,
-      ...readStats(),
+      store: logPath(),
+      ...readPanel(),
     });
   }
 
@@ -275,91 +264,86 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
 
   private html(): string {
     return `<!doctype html><html><head><meta charset="utf-8"><style>
-      :root{color-scheme:light dark}
       body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);padding:10px 12px;font-size:12px}
       .row{display:flex;align-items:center;gap:6px}
-      .dot{width:9px;height:9px;border-radius:50%;cursor:pointer}
-      .on{background:#3fb950}.off{background:#8b949e}
+      .dot{width:9px;height:9px;border-radius:50%;cursor:pointer}.on{background:#3fb950}.off{background:#8b949e}
       .grow{flex:1}
-      .sub{opacity:.6;font-size:11px}
-      .big{font-size:28px;font-weight:600;line-height:1.1;margin-top:6px}
-      h4{margin:14px 0 5px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;opacity:.55}
-      .metric{font-size:22px;font-weight:600}
-      .bar{height:6px;border-radius:4px;background:var(--vscode-input-background,#2228);overflow:hidden;margin:2px 0 6px}
-      .bar>i{display:block;height:100%}
-      .obrow{display:flex;align-items:center;gap:8px;font-size:11px;margin-top:6px}
-      .obrow .lbl{width:104px}.obrow .n{width:28px;text-align:right;opacity:.8}
-      .obrow .track{flex:1}
+      .sub{opacity:.62;font-size:11px;line-height:1.45;margin-top:5px}
+      .lead{font-weight:600;margin-top:12px}
+      .cards{display:flex;gap:8px;margin-top:7px}
+      .card{flex:1;background:var(--vscode-input-background,#80808022);border-radius:7px;padding:9px 6px;text-align:center}
+      .num{font-size:25px;font-weight:700;line-height:1}.num.pos{color:#3fb950}.num.amber{color:#d29922}
+      .clbl{font-size:10px;opacity:.72;margin-top:5px;line-height:1.25}
+      h4{margin:15px 0 4px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;opacity:.55}
+      .metric{font-size:23px;font-weight:700}
       ul{list-style:none;padding:0;margin:0}
-      li{display:flex;gap:8px;padding:2px 0;font-size:11px;white-space:nowrap;overflow:hidden}
-      li .f{flex:1;overflow:hidden;text-overflow:ellipsis}
-      li .t{opacity:.5}
-      .neg{color:#f85149}.pos{color:#3fb950}.weak{opacity:.6}
-      button{width:100%;padding:6px;cursor:pointer;border:none;border-radius:4px;
-        background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-top:10px;font-size:12px}
-      .acts{display:flex;gap:6px;margin-top:8px}
-      .acts button{margin-top:0;padding:5px 0;font-size:11px;background:var(--vscode-button-secondaryBackground,#3a3d41);color:var(--vscode-button-secondaryForeground,#fff)}
-      .muted{opacity:.5;font-size:10px;margin-top:12px;word-break:break-all}
-      .empty{opacity:.6;font-size:11px;margin-top:6px;line-height:1.5}
+      li{padding:6px 0;border-top:1px solid var(--vscode-input-background,#80808026)}
+      li:first-child{border-top:none}
+      .it{display:flex;align-items:center;gap:6px}
+      .iv{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .inf{opacity:.62;font-size:11px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .tag{font-size:9px;text-transform:uppercase;letter-spacing:.03em;padding:1px 6px;border-radius:9px;color:#fff;flex:none}
+      .tag.green{background:#3fb950}.tag.amber{background:#d29922}
+      .t{opacity:.7}
+      button{width:100%;padding:6px;cursor:pointer;border:none;border-radius:4px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-top:14px}
+      .muted{opacity:.5;font-size:10px;margin-top:10px;word-break:break-all}
+      .empty{opacity:.72;font-size:11px;margin-top:8px;line-height:1.55}
     </style></head><body>
-      <div class="row"><span id="dot" class="dot off" title="toggle capture"></span>
+      <div class="row"><span id="dot" class="dot off" title="pause / resume watching"></span>
         <b id="state">…</b><span class="grow"></span><span class="sub" id="sess"></span></div>
 
-      <div class="big" id="total">0</div>
-      <div class="sub" id="totalsub">interactions captured</div>
+      <div class="lead">What your double did for you</div>
+      <div class="cards">
+        <div class="card"><div class="num pos" id="handled">0</div><div class="clbl">handled<br>without asking</div></div>
+        <div class="card"><div class="num amber" id="asked">0</div><div class="clbl">checked<br>with you</div></div>
+      </div>
+      <div class="sub">When Claude changes code, your double decides whether to <b>let it through</b> or
+        <b>pause and ask you</b> — learned from how you've accepted, edited, or reverted changes before.
+        It infers from what you do; you never label anything.</div>
 
-      <div id="content" style="display:none">
-        <h4>Override rate</h4>
-        <div class="metric" id="orate">0%</div>
-        <div class="sub">overrides + reverts ÷ total — the number the double should drive down as it learns you</div>
+      <div id="has">
+        <h4>How often it interrupts you</h4>
+        <div class="metric" id="rate">0%</div>
+        <div class="sub">share of Claude's actions it paused on. This should fall as it learns your taste.</div>
 
-        <h4>Outcomes</h4><div id="outcomes"></div>
-
-        <h4>Recent</h4><ul id="recent"></ul>
+        <h4>Recently inferred</h4>
+        <ul id="recent"></ul>
       </div>
 
-      <div id="empty" class="empty">
-        No interactions yet.<br>Paste or accept a 3+ line block in any file — it'll show up here,
-        and the affected lines flash briefly. Or run <code>codedouble on</code> in a repo to mine its git history.
+      <div id="none" class="empty">
+        Your double is watching, but hasn't weighed in on a Claude action yet. As you use Claude
+        (with the gateway on), every edit/command it sees shows up here as <b>handled</b> or
+        <b>checked</b>, along with what it inferred you'd want.
       </div>
 
       <button id="report">Open report ▸</button>
-      <div class="acts">
-        <button id="accept" title="Mark selection as reviewed & accepted">✓ accept</button>
-        <button id="override" title="Mark selection as an override">✎ override</button>
-        <button id="reject" title="Mark selection as rejected">✗ reject</button>
-      </div>
-      <div class="muted" id="store"></div>
+      <div class="muted" id="foot"></div>
 
       <script>
         const vscode=acquireVsCodeApi();
         const $=id=>document.getElementById(id);
-        const send=cmd=>vscode.postMessage({cmd});
-        $('report').onclick=()=>send('openReport');
-        $('dot').onclick=()=>send('toggle');
-        $('accept').onclick=()=>send('accept');
-        $('override').onclick=()=>send('override');
-        $('reject').onclick=()=>send('reject');
+        $('report').onclick=()=>vscode.postMessage({cmd:'openReport'});
+        $('dot').onclick=()=>vscode.postMessage({cmd:'toggle'});
         addEventListener('message',e=>{const s=e.data;
           $('dot').className='dot '+(s.enabled?'on':'off');
-          $('state').textContent=s.enabled?'capturing':'paused';
-          $('sess').textContent=(s.session||0)+' this session';
-          $('total').textContent=s.total||0;
-          $('totalsub').textContent='interactions captured'+(s.repos>1?(' · '+s.repos+' repos'):'');
-          const has=(s.total||0)>0;
-          $('content').style.display=has?'block':'none';
-          $('empty').style.display=has?'none':'block';
-          $('orate').textContent=(s.overrideRate||0)+'%';
-          $('orate').className='metric '+((s.overrideRate||0)>25?'neg':(s.overrideRate<=10?'pos':''));
-          $('outcomes').innerHTML=(s.outcomes||[]).map(o=>
-            '<div class="obrow"><span class="lbl">'+o.k+'</span>'+
-            '<span class="track"><span class="bar"><i style="width:'+o.pct+'%;background:'+o.color+'"></i></span></span>'+
-            '<span class="n">'+o.v+'</span></div>').join('');
-          $('recent').innerHTML=(s.recent||[]).map(r=>
-            '<li class="'+(r.neg?'neg':(r.pos?'pos':'weak'))+'">'+
-            '<span class="f">'+r.outcome+' · '+(r.file||'')+'</span><span class="t">'+(r.rel||'')+'</span></li>').join('')
-            || '<li class="weak">—</li>';
-          $('store').textContent=s.store||'';
+          $('state').textContent=s.enabled?'watching':'paused';
+          $('sess').textContent=(s.session||0)+' captured this session';
+          $('handled').textContent=s.handled||0;
+          $('asked').textContent=s.asked||0;
+          const seen=s.seen||0;
+          $('has').style.display=seen?'block':'none';
+          $('none').style.display=seen?'none':'block';
+          $('rate').textContent=(s.interceptRate||0)+'%';
+          $('rate').className='metric '+((s.interceptRate||0)>30?'amber':'pos');
+          $('recent').innerHTML=(s.recent||[]).map(r=>{
+            const tag=r.asked?'<span class="tag amber">checked</span>':'<span class="tag green">handled</span>';
+            const inf=r.resolution?('you usually \\u2192 '+r.resolution):(r.n?'weak precedent':'no precedent yet');
+            const meta=(r.rel?(' \\u00b7 '+r.rel):'')+(r.conf?(' \\u00b7 '+Math.round(r.conf*100)+'%'):'');
+            return '<li><div class="it">'+tag+'<span class="iv">'+r.intent+'</span></div>'+
+                   '<div class="inf">'+inf+'<span class="t">'+meta+'</span></div></li>';
+          }).join('')||'<li class="inf">—</li>';
+          $('foot').textContent='Watching '+(s.watching||0)+' interactions'+
+            (s.repos>1?(' across '+s.repos+' repos'):'')+' — passively, no buttons. '+(s.store||'~/.codedouble');
         });
       </script></body></html>`;
   }
@@ -383,21 +367,22 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeTextDocument(onChange),
     vscode.window.onDidChangeTextEditorVisibleRanges(onVisible),
 
+    // Power-user overrides (palette only) — capture is otherwise fully passive.
     vscode.commands.registerCommand("codedouble.acceptReviewed", () => {
       const s = selectionText(); if (!s) return;
       record(s.doc, "confirmed_good", firstLine(s.text), null, s.text, "edit", s.range);
-      vscode.window.setStatusBarMessage("CodeDouble: confirmed-good (reviewed)", 2500);
+      vscode.window.setStatusBarMessage("CodeDouble: marked accepted", 2500);
     }),
     vscode.commands.registerCommand("codedouble.markOverride", async () => {
       const s = selectionText(); if (!s) return;
-      const from = await vscode.window.showInputBox({ prompt: "What did the AI propose that you changed? (the original X)", placeHolder: "blank if unknown" });
+      const from = await vscode.window.showInputBox({ prompt: "What did the AI propose that you changed? (the original)", placeHolder: "blank if unknown" });
       record(s.doc, "override", firstLine(s.text), from ? firstLine(from) : null, s.text, "edit", s.range);
-      vscode.window.setStatusBarMessage("CodeDouble: override (X→Y)", 2500);
+      vscode.window.setStatusBarMessage("CodeDouble: marked override", 2500);
     }),
     vscode.commands.registerCommand("codedouble.reject", () => {
       const s = selectionText(); if (!s) return;
       record(s.doc, "interrupt", firstLine(s.text), null, s.text, "edit", s.range);
-      vscode.window.setStatusBarMessage("CodeDouble: reject/interrupt", 2500);
+      vscode.window.setStatusBarMessage("CodeDouble: marked rejected", 2500);
     }),
     vscode.commands.registerCommand("codedouble.openReport", () => {
       const term = vscode.window.createTerminal("codedouble");
@@ -409,7 +394,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const next = !conf.get<boolean>("enabled", true);
       await conf.update("enabled", next, vscode.ConfigurationTarget.Global);
       updateStatus(); view?.refresh();
-      vscode.window.setStatusBarMessage(`CodeDouble capture ${next ? "ON" : "OFF"}`, 2500);
+      vscode.window.setStatusBarMessage(`CodeDouble ${next ? "watching" : "paused"}`, 2500);
     })
   );
 }
