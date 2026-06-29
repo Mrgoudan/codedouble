@@ -2,7 +2,7 @@
   "name": "vscode-codedouble",
   "displayName": "CodeDouble Capture",
   "description": "Faithfully records editor interactions (accept / override / reject / viewed) into .codedouble/interactions.jsonl for the Self-Learning Code Double, with a live panel.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "codedouble",
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other"],
