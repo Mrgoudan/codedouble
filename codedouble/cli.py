@@ -748,6 +748,61 @@ def cmd_models(args):
     print(f"\ndefault when no --model/CODEDOUBLE_OLLAMA_MODEL is set:  {default}")
 
 
+def cmd_setup(args):
+    """Frictionless wiring: create the store, an LLM-port template, and merge the
+    Claude Code hooks (intake + outtake + reply-capture) into settings.json —
+    idempotent, with a backup, preserving any existing hooks."""
+    import shutil
+    home = codedouble_home()
+    os.makedirs(home, exist_ok=True)
+    print(f"[codedouble setup] store: {home}")
+
+    lp = os.path.join(home, "llm.json")              # LLM port template (no secrets)
+    if not os.path.exists(lp):
+        with open(lp, "w") as f:
+            json.dump({"base_url": "", "model": "",
+                       "api_key_file": "", "api_key_field": []}, f, indent=2)
+        print(f"  wrote LLM-port template -> {lp}  (fill base_url/model/api_key_* to enable a remote LLM)")
+    else:
+        print(f"  LLM port present       -> {lp}")
+
+    sp = os.path.expanduser(args.settings)
+    try:
+        d = json.load(open(sp)) if os.path.exists(sp) else {}
+    except Exception:
+        d = {}
+    if os.path.exists(sp):
+        shutil.copy(sp, sp + ".codedouble-setup.bak")
+    hooks = d.setdefault("hooks", {})
+    pre = ("CODEDOUBLE_ENFORCE=1 " if args.enforce else "") + \
+          ("CODEDOUBLE_QC=1 " if args.qc else "") + "python3 -m codedouble.cli hook"
+
+    def ensure(event, matcher, command):
+        arr = hooks.setdefault(event, [])
+        for blk in arr:
+            for h in blk.get("hooks", []):
+                if "codedouble.cli hook" in h.get("command", ""):
+                    h["command"] = command              # update (e.g. flag changes)
+                    return "updated"
+        arr.append({"matcher": matcher, "hooks": [{"type": "command", "command": command, "timeout": 30}]})
+        return "added"
+
+    r = {
+        "UserPromptSubmit": ensure("UserPromptSubmit", "", "python3 -m codedouble.cli hook"),
+        "PreToolUse": ensure("PreToolUse", "Edit|Write|Bash", pre),
+        "PostToolUse": ensure("PostToolUse", "Edit|Write|Bash", "python3 -m codedouble.cli hook"),
+    }
+    try:
+        os.makedirs(os.path.dirname(sp), exist_ok=True)
+        with open(sp, "w") as f:
+            json.dump(d, f, indent=2)
+        print(f"  hooks -> {sp}: " + ", ".join(f"{k} {v}" for k, v in r.items()))
+    except Exception as e:
+        print("  could not write settings:", e)
+    print(f"  mode: {'ENFORCE' if args.enforce else 'shadow'}{' + QC' if args.qc else ''}. "
+          "Start a new Claude Code session to load the hooks.")
+
+
 def cmd_status(args):
     raw = EventLog(args.log).read()
     hook = os.path.join(args.repo, ".git", "hooks", "post-commit")
@@ -809,6 +864,12 @@ def main(argv=None):
                    help="age(s) after which it's 'confirmed good' (default 1d)")
     p.add_argument("--min-promote", dest="min_promote", type=int, default=3)
     p.add_argument("--quiet", action="store_true"); p.set_defaults(func=cmd_reflect)
+
+    p = sub.add_parser("setup", help="frictionless: wire Claude Code hooks + store + LLM-port template")
+    p.add_argument("--settings", default="~/.claude/settings.json")
+    p.add_argument("--enforce", action="store_true", help="gate acts (send-back), not just shadow")
+    p.add_argument("--qc", action="store_true", help="LLM quality/drift check on edits")
+    p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("summarize", help="consolidate each session's running notes into an intent summary (run on idle)")
     p.add_argument("--quiet", action="store_true"); p.set_defaults(func=cmd_summarize)
