@@ -152,6 +152,7 @@ function decisionsPath(): string {
 
 interface Panel {
   watching: number;   // interactions captured passively (all repos)
+  goal: string;       // this session's overall goal (from its anchors)
   repos: number;
   learned: number;    // distilled preference rules (from reflection)
   reactions: Array<{ k: string; v: number }>;                 // your reactions, by kind
@@ -160,13 +161,13 @@ interface Panel {
   handled: number;    // let through, on your behalf
   rejected: number;   // sent back to the AI to redo
   interceptRate: number;
-  sentBack: Array<{ intent: string; before: string; after: string; rel: string }>;  // before → after
+  sentBack: Array<{ intent: string; before: string; why: string; rel: string }>;  // AI tried → why sent back
   recent: Array<{ intent: string; resolution: string; tag: string; conf: number; n: number; rel: string }>;
 }
 
-function shortIntent(s: string): string {
+function shortIntent(s: string, n = 72): string {
   s = (s || "").replace(/\s+/g, " ").trim();
-  return s.length > 72 ? s.slice(0, 71) + "…" : s;
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
 function readPanel(): Panel {
@@ -206,40 +207,67 @@ function readPanel(): Panel {
     if (v === undefined || v === "shadow") return r.ask ? "sent back" : "handled";
     return "handled"; // inject | allow | watch | answered
   };
-  let seen = 0, handled = 0, rejected = 0;
+  let seen = 0, handled = 0, rejected = 0, goal = "";
   const recent: Panel["recent"] = [];
   const sentBack: Panel["sentBack"] = [];
   try {
-    const lines = fs.readFileSync(decisionsPath(), "utf8").split("\n").filter((l) => l.trim());
-    seen = lines.length;
-    for (const l of lines) {
-      try {
-        if (tagOf(JSON.parse(l)) === "sent back") rejected++; else handled++;
-      } catch { /* skip */ }
+    const recs = fs.readFileSync(decisionsPath(), "utf8").split("\n")
+      .filter((l) => l.trim())
+      .map((l) => { try { return JSON.parse(l) as Record<string, unknown>; } catch { return null; } })
+      .filter((r): r is Record<string, unknown> => !!r);
+    // PAIR the panel with the AI session running in THIS window's folder: only
+    // consider decisions whose cwd is inside an open workspace folder (the global
+    // decisions log mixes every project's sessions). Fall back to all if none match.
+    const folders = (vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath);
+    const here = (r: Record<string, unknown>): boolean => {
+      const c = String(r.cwd || "");
+      return !c ? false : (!folders.length || folders.some((f) => c === f || c.startsWith(f + "/")));
+    };
+    const local = recs.filter(here);
+    // only fall back to the global log when NO record carries a cwd yet (old data);
+    // if this folder simply has no session, show nothing rather than leak another's.
+    const anyCwd = recs.some((r) => !!r.cwd);
+    const pool = (folders.length && anyCwd) ? local : recs;
+    // "this session" = the most recent session in this window's folder
+    let sid = "";
+    for (let i = pool.length - 1; i >= 0; i--) {
+      const v = String(pool[i].session_id || "");
+      if (v) { sid = v; break; }
     }
-    for (const l of lines.slice(-14).reverse()) {
+    const scoped = sid ? pool.filter((r) => String(r.session_id || "") === sid) : pool;
+    seen = scoped.length;
+    // GOAL persists per session: its consolidated goal, else a heuristic from its OWN
+    // first prompt (always stored in its notes) — so opening ANY of the folder's
+    // sessions shows that session's goal, never another's, even before consolidation.
+    const sdir = path.join(path.dirname(logPath()), "sessions");
+    try {
+      if (sid) goal = String((JSON.parse(
+        fs.readFileSync(path.join(sdir, sid + ".anchors.json"), "utf8")) as Record<string, unknown>).goal || "");
+    } catch { /* not consolidated yet */ }
+    if (!goal && sid) {
       try {
-        const r = JSON.parse(l);
-        recent.push({
-          intent: shortIntent(r.intent || r.tool || r.event || "decision"),
-          resolution: shortIntent(r.resolution || ""),
-          tag: tagOf(r), conf: r.confidence || 0, n: r.n || 0, rel: relTime(r.ts || 0),
-        });
-      } catch { /* skip */ }
-    }
-    // every send-back (deny), newest first — the before → after people want to see
-    for (const l of lines.reverse()) {
-      if (sentBack.length >= 8) break;
-      try {
-        const r = JSON.parse(l);
-        if ((r.verdict === "deny") && (r.before || r.after)) {
-          sentBack.push({
-            intent: shortIntent(r.intent || r.tool || ""),
-            before: shortIntent(r.before || ""), after: shortIntent(r.after || r.resolution || ""),
-            rel: relTime(r.ts || 0),
-          });
+        for (const l of fs.readFileSync(path.join(sdir, sid + ".jsonl"), "utf8").split("\n")) {
+          if (!l.trim()) continue;
+          const p = String((JSON.parse(l) as Record<string, unknown>).prompt || "").replace(/\s+/g, " ").trim();
+          if (p.length >= 12) {
+            goal = p.split(/(?<=[.!?])\s/)[0].split(/\s+at\s+[~/]/)[0].replace(/\s*\([^)]*\)/g, "").trim().slice(0, 140);
+            break;
+          }
         }
-      } catch { /* skip */ }
+      } catch { /* no notes */ }
+    }
+    for (const r of scoped) { if (tagOf(r) === "sent back") rejected++; else handled++; }
+    // every send-back THIS session, newest first — the AI's try → why it was sent back
+    for (let i = scoped.length - 1; i >= 0 && sentBack.length < 25; i--) {
+      const r = scoped[i];
+      if (r.verdict === "deny" && (r.before || r.after || r.reason)) {
+        sentBack.push({
+          intent: shortIntent(String(r.target || r.intent || r.tool || "")),
+          before: shortIntent(String(r.before || ""), 140),
+          why: shortIntent(String(r.reason || r.after || "redo"), 220),
+          rel: relTime(Number(r.ts) || 0),
+        });
+      }
     }
   } catch { /* gateway not active yet */ }
   let learned = 0;
@@ -249,7 +277,7 @@ function readPanel(): Panel {
   } catch { /* not reflected yet */ }
   return {
     watching, repos: repos.size, learned, reactions, overrides, seen, handled, rejected,
-    interceptRate: seen ? Math.round((100 * rejected) / seen) : 0, sentBack, recent,
+    interceptRate: seen ? Math.round((100 * rejected) / seen) : 0, sentBack, recent, goal,
   };
 }
 
@@ -398,46 +426,28 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       button{width:100%;padding:6px;cursor:pointer;border:none;border-radius:4px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);margin-top:14px}
       .muted{opacity:.5;font-size:10px;margin-top:10px;word-break:break-all}
       .empty{opacity:.72;font-size:11px;margin-top:8px;line-height:1.55}
+      .goal{margin-top:12px;padding:8px 10px;border-radius:7px;background:var(--vscode-input-background,#80808022);font-size:12px;line-height:1.4}
+      .glbl{font-size:9px;text-transform:uppercase;letter-spacing:.06em;opacity:.55;margin-right:6px}
     </style></head><body>
       <div class="row"><span id="dot" class="dot off" title="pause / resume watching"></span>
         <b id="state">…</b><span class="grow"></span><span class="sub" id="sess"></span></div>
 
-      <div class="lead">What your double did for you</div>
+      <div id="goalbox" class="goal"><span class="glbl">this session’s goal</span><span id="goal"></span></div>
+
+      <div class="lead">Sent back to redo <span class="hint">— this session</span></div>
       <div class="cards">
-        <div class="card"><div class="num pos" id="handled">0</div><div class="clbl">let through<br>for you</div></div>
         <div class="card"><div class="num red" id="rejected">0</div><div class="clbl">sent back<br>to the AI</div></div>
+        <div class="card"><div class="num pos" id="handled">0</div><div class="clbl">let<br>through</div></div>
       </div>
-      <div class="sub">The double watches your conversation with the AI and acts <b>on your behalf, toward the AI</b> —
-        it <b>steers</b> the AI toward what you prefer, lets good changes <b>through</b>, or <b>sends the AI back to redo</b>
-        ones you'd reject. You only ever talk to the AI; the double never interrupts you. It learns from how you accept,
-        edit, and revert — no labelling.
-        <i>(Acting requires enforce mode — otherwise these are what it <b>would</b> do.)</i></div>
 
       <div id="sb">
-        <h4>Sent back to redo <span class="hint">— AI's version → what your double asked for</span></h4>
+        <h4>What the AI tried <span class="hint">→ why codedouble sent it back</span></h4>
         <ul id="sentback"></ul>
       </div>
 
-      <div id="react">
-        <h4>Your reactions to AI changes</h4>
-        <div id="reactions"></div>
-        <h4>Recent overrides <span class="hint">— where you corrected the AI</span></h4>
-        <ul id="overrides"></ul>
-      </div>
-
-      <div id="has">
-        <h4>How often it stepped in</h4>
-        <div class="metric" id="rate">0%</div>
-        <div class="sub">share of the AI's actions it sent back on your behalf. Should fall as it learns your taste.</div>
-
-        <h4>Recently inferred</h4>
-        <ul id="recent"></ul>
-      </div>
-
       <div id="none" class="empty">
-        Your double is watching your AI conversation, but hasn't acted on an AI action yet. As you
-        use the AI (with the gateway on), each edit/command it sees shows up here as <b>let through</b>
-        or <b>sent back to the AI</b>, along with what it inferred you'd want — you're never interrupted.
+        No send-backs in this session yet. When codedouble sends an AI change back to redo,
+        the AI's version and the reason it was rejected show up here. <i>(Requires enforce mode.)</i>
       </div>
 
       <button id="report">Open report ▸</button>
@@ -451,46 +461,18 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
         addEventListener('message',e=>{const s=e.data;
           $('dot').className='dot '+(s.enabled?'on':'off');
           $('state').textContent=s.enabled?'watching':'paused';
-          $('sess').textContent=(s.session||0)+' captured this session';
-          $('handled').textContent=s.handled||0;
+          $('sess').textContent='this session';
+          $('goal').textContent=s.goal||'';
+          $('goalbox').style.display=s.goal?'block':'none';
           $('rejected').textContent=s.rejected||0;
-          $('sb').style.display=(s.sentBack&&s.sentBack.length)?'block':'none';
-          $('sentback').innerHTML=(s.sentBack||[]).map(o=>
-            '<li><div class="it"><span class="tag red">sent back</span><span class="iv">'+(o.intent||'')+'</span><span class="t">'+(o.rel||'')+'</span></div>'+
-            '<div class="ba"><span class="bf">AI: '+(o.before||'?')+'</span><br><span class="af">\\u2192 '+(o.after||'redo')+'</span></div></li>').join('');
-          const seen=s.seen||0;
-          $('has').style.display=seen?'block':'none';
-          $('none').style.display=seen?'none':'block';
-          $('rate').textContent=(s.interceptRate||0)+'%';
-          $('rate').className='metric '+((s.interceptRate||0)>30?'amber':'pos');
-          const TAGC={'sent back':'tag red',handled:'tag green'};
-          $('recent').innerHTML=(s.recent||[]).map(r=>{
-            const tag='<span class="'+(TAGC[r.tag]||'tag green')+'">'+(r.tag||'handled')+'</span>';
-            const inf=r.resolution?('you usually \\u2192 '+r.resolution):(r.n?'weak precedent':'no precedent yet');
-            const meta=(r.rel?(' \\u00b7 '+r.rel):'')+(r.conf?(' \\u00b7 '+Math.round(r.conf*100)+'%'):'');
-            return '<li><div class="it">'+tag+'<span class="iv">'+r.intent+'</span></div>'+
-                   '<div class="inf">'+inf+'<span class="t">'+meta+'</span></div></li>';
-          }).join('')||'<li class="inf">—</li>';
-          const RC={override:'#f85149',revert:'#f85149',interrupt:'#f85149',confirmed_good:'#3fb950',answered:'#3fb950',accepted_silent:'#8b949e',never_viewed:'#6e7681',pending:'#d29922'};
-          const RD={override:"you edited the AI's change — your strongest preference signal",
-            revert:"you undid the AI's change entirely",interrupt:"you stopped / rejected the change",
-            accepted_silent:"you kept it unchanged after seeing it — tacit approval",
-            never_viewed:"it settled before you scrolled to it — a weak signal",
-            confirmed_good:"you explicitly marked it good",answered:"the double asked and you answered",
-            pending:"awaiting your reaction"};
-          $('react').style.display=(s.watching?'block':'none');
-          $('reactions').innerHTML=(s.reactions||[]).map(o=>
-            '<div class="rx"><div class="rxh"><span class="rdot" style="background:'+(RC[o.k]||'#888')+'"></span>'+
-            '<span class="rk">'+o.k+'</span><span class="rn">'+o.v+'</span></div>'+
-            '<div class="rd">'+(RD[o.k]||'')+'</div></div>').join('');
-          $('overrides').innerHTML=(s.overrides||[]).map(o=>
-            '<li><div class="it"><span class="iv">'+(o.file||'?')+'</span><span class="t">'+(o.rel||'')+'</span></div>'+
-            '<div class="inf">'+(o.from?('AI: '+o.from+' \\u2192 you: '+(o.to||'?')):('you wrote: '+(o.to||'?')))+'</div></li>').join('')
-            ||'<li class="inf">no overrides yet — when you edit an AI change, the before\\u2192after appears here</li>';
-          $('foot').textContent='Watching '+(s.watching||0)+' interactions'+
-            (s.repos>1?(' across '+s.repos+' repos'):'')+
-            (s.learned?(' · learned '+s.learned+' rule'+(s.learned>1?'s':'')):'')+
-            ' — passively. '+(s.store||'~/.codedouble');
+          $('handled').textContent=s.handled||0;
+          const sb=s.sentBack||[];
+          $('sb').style.display=sb.length?'block':'none';
+          $('none').style.display=sb.length?'none':'block';
+          $('sentback').innerHTML=sb.map(o=>
+            '<li><div class="it"><span class="tag red">sent back</span><span class="iv">'+(o.intent||'?')+'</span><span class="t">'+(o.rel||'')+'</span></div>'+
+            '<div class="ba"><span class="bf">AI: '+(o.before||'?')+'</span><br><span class="af">→ '+(o.why||'redo')+'</span></div></li>').join('');
+          $('foot').textContent=(s.store||'~/.codedouble');
         });
       </script></body></html>`;
   }

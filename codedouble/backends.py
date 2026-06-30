@@ -335,6 +335,9 @@ def llm_complete(prompt, system=None, json_mode=False, timeout=90.0, prefer="loc
     Each tier falls through to the other; if neither is reachable it raises, and the
     caller drops to its cheap heuristic. Reserves the rate-limited remote keys for
     the work that actually needs them."""
+    if os.environ.get("CODEDOUBLE_NO_LLM") == "1":
+        # explicit offline / deterministic mode (tests, air-gapped) -> caller's heuristic
+        raise RuntimeError("LLM disabled (CODEDOUBLE_NO_LLM=1)")
     base, keys, model = _llm_config()
     ol = list_ollama_models()
 

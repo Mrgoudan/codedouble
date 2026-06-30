@@ -172,5 +172,161 @@ class TestLoggerViz(unittest.TestCase):
             self.assertIn("<svg", f.read())
 
 
+class TestAnchorGraduation(unittest.TestCase):
+    """The local->over-time bridge: graduating session anchors into the durable
+    global store, and seeding a fresh session back from it. Deterministic (the
+    LLM tier is disabled) so only the heuristic paths are exercised."""
+
+    def setUp(self):
+        import tempfile, json
+        from codedouble import cli
+        os.environ["CODEDOUBLE_NO_LLM"] = "1"          # force heuristic dedupe (no network)
+        self.cli, self.json = cli, json
+        self.d = tempfile.mkdtemp()
+        self.log = os.path.join(self.d, "decisions.jsonl")
+
+    def tearDown(self):
+        os.environ.pop("CODEDOUBLE_NO_LLM", None)
+
+    def _global(self):
+        gp = self.cli._scope_anchors_path(self.log, "default")
+        return self.json.loads(open(gp).read())
+
+    def test_heuristic_collapses_pileup(self):
+        # the exact kind of near-duplicate pile-up seen live in anchors.global.json
+        items = [
+            "REAL runs only — no simulated or assumed outputs.",
+            "Use ABSOLUTE paths only (cwd is empty scratch).",
+            "Use ABSOLUTE paths only; cwd is empty scratch",
+            "Use ABSOLUTE paths only; cwd is empty scratch.",
+            "SAFE=/home/ziruichen/bsd/llvm-project-dup/libcbs/src/bishengc_safety/bishengc_safety.cb",
+            "SAFE=/home/ziruichen/bsd/llvm-project-dup/libcbs/src/bishengc_safety/bishe",  # truncated
+            "CL=/home/ziruichen/bsd/llvm-project-dup/build/bin/clang",
+            "CL=/home/ziruuchen/bsd/llvm-project-dup/build/bin/clang",  # typo'd dup
+        ]
+        out = self.cli._dedupe_anchors(items)
+        self.assertLess(len(out), len(items))
+        # the three "ABSOLUTE paths only" phrasings collapse to one
+        self.assertEqual(sum("ABSOLUTE paths only" in x for x in out), 1)
+        # the truncated SAFE fragment is absorbed into the full path (does not survive)
+        self.assertFalse(any(x.endswith("/bishe") for x in out))
+        # the typo'd CL collapses; the correctly-spelled one is kept
+        cls = [x for x in out if x.startswith("CL=")]
+        self.assertEqual(len(cls), 1)
+        self.assertIn("ziruichen", cls[0])
+        self.assertNotIn("ziruuchen", cls[0])
+
+    def test_heuristic_collapses_paraphrase_family(self):
+        # the "real runs" paraphrase family that re-bloated the live store — must
+        # collapse via the heuristic ALONE (the LLM tier is rate-limited / best-effort)
+        fam = [
+            "REAL runs only — no simulation or guessing",
+            "Do REAL runs, no simulation",
+            "Run real compilations only; never speculate",
+            "Real runs only; never speculate.",
+            "Do REAL runs (no simulation).",
+        ]
+        out = self.cli._dedupe_anchors(fam)
+        self.assertLessEqual(len(out), 2)
+        # but a genuinely distinct constraint is NOT swallowed
+        out2 = self.cli._dedupe_anchors(fam + ["Use ABSOLUTE paths only (cwd is empty scratch)"])
+        self.assertTrue(any("ABSOLUTE paths" in x for x in out2))
+
+    def test_goal_never_enters_distill(self):
+        # goal is SESSION-ONLY: it must never propagate into a project/global distill
+        self.cli._merge_project_distill(self.log, {"goal": "some goal", "constraints": ["c1"]}, "default")
+        g = self._global()
+        self.assertNotIn("goal", g)
+        self.assertIn("c1", g.get("constraints") or [])
+
+    def test_seed_is_separated_by_project_scope(self):
+        # the real fix: separation is STRUCTURAL, by project (cwd's repo root), not by
+        # token overlap. Two projects on the same machine cannot contaminate each other.
+        import tempfile
+        proj_a = tempfile.mkdtemp()    # a BSC compiler-hunt scratch dir
+        proj_b = tempfile.mkdtemp()    # the codedouble repo
+        self.cli._merge_project_distill(self.log, {
+            "goal": "Hunt compiler bugs in BSC",
+            "constraints": ["Use INC=-I/home/x/bsc_include for includes", "REAL runs only"],
+        }, self.cli._scope_key(proj_a))
+        self.cli._merge_project_distill(self.log, {
+            "goal": "build codedouble",
+            "constraints": ["Smart dispatch: hard -> remote LLM, else ollama"],
+        }, self.cli._scope_key(proj_b))
+
+        # a fresh session whose cwd is project B inherits ONLY project B's anchors
+        self.cli._session_note(self.log, "sB", "continue the work", proj_b)
+        seeded = self.cli._session_anchors(self.log, "sB")
+        self.assertIn("dispatch", seeded)            # B's own bucket
+        self.assertNotIn("bsc_include", seeded)      # A's anchors never cross over
+        self.assertNotIn("Hunt compiler", seeded)
+        self.assertNotIn("Goal:", seeded)            # goal still never seeded
+
+        # a session with no cwd (scope 'default') seeds from neither project
+        self.cli._session_note(self.log, "sNone", "hello")
+        self.assertEqual(self.cli._session_anchors(self.log, "sNone"), "")
+
+    def test_own_anchors_take_precedence_over_seed(self):
+        # once a session has consolidated its OWN anchors, they win verbatim (incl. goal)
+        self.cli._merge_project_distill(self.log, {"goal": "global g", "constraints": ["global c"]})
+        ap = self.cli._sid_file(self.log, "s_own", ".anchors.json")
+        with open(ap, "w") as f:
+            f.write(self.json.dumps({"goal": "my own goal", "constraints": ["my own constraint"]}))
+        out = self.cli._session_anchors(self.log, "s_own")
+        self.assertIn("my own goal", out)
+        self.assertIn("my own constraint", out)
+        self.assertNotIn("global c", out)
+
+    def test_global_distill_promotes_cross_project_rules(self):
+        # a habit that RECURS across projects globalizes; a project-specific rule does not
+        import tempfile
+        a, b, c = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.cli._merge_project_distill(self.log, {"constraints": [
+            "REAL runs only, never simulate", "Use INC=-I/x/bsc_include"]},
+            self.cli._scope_key(a))
+        self.cli._merge_project_distill(self.log, {"constraints": ["Real runs only; never simulate"]},
+            self.cli._scope_key(b))
+        self.cli._promote_global(self.log)
+        glob = self.json.loads(open(self.cli._global_distill_path(self.log)).read())
+        flat = (" | ".join(glob.get("constraints") or [])).lower()
+        self.assertIn("runs only", flat)             # in A and B -> promoted to global
+        self.assertNotIn("bsc_include", flat)        # A-only -> stays project-local
+
+        # a fresh session in a NEW project C is primed by the global distill only
+        self.cli._session_note(self.log, "sC", "do stuff", c)
+        seeded = self.cli._session_anchors(self.log, "sC")
+        self.assertIn("runs only", seeded.lower())
+        self.assertNotIn("bsc_include", seeded)
+
+    def test_drift_avoid_list_is_deterministic(self):
+        # an action that matches the session's AVOID list is drift, caught without an LLM
+        anchors = {"goal": "use session id as the context key",
+                   "avoid": ["Using project ID alone as the key for separation"]}
+        drift, reason, redirect = self.cli._drift_check(
+            anchors, "refactor _scope_key to use the project id alone as the key", "")
+        self.assertTrue(drift)
+        self.assertIn("project", reason.lower())
+        self.assertTrue(redirect)
+
+    def test_drift_needs_an_established_goal(self):
+        # no consolidated goal yet -> never flag (don't block early exploration)
+        drift, _, _ = self.cli._drift_check(
+            {"avoid": ["use project id alone as key"]},
+            "use project id alone as the key everywhere", "")
+        self.assertFalse(drift)
+
+    def test_drift_allows_on_goal_action(self):
+        # an action plainly serving the goal, with no avoid hit, is not drift (no LLM)
+        anchors = {"goal": "fix the anchor dedup", "avoid": ["use project id alone as key"]}
+        drift, _, _ = self.cli._drift_check(anchors, "improve _dedupe_anchors collapsing", "")
+        self.assertFalse(drift)
+
+    def test_heuristic_goal_is_clean(self):
+        # offline goal fallback: first prompt, minus the path tail and parentheticals
+        g = self.cli._heuristic_goal(
+            ["Continue work on codedouble (the Self-Learning Code Double) at /home/x/y (gitee, main). It's an external monitor."])
+        self.assertEqual(g, "Continue work on codedouble")
+        self.assertEqual(self.cli._heuristic_goal([]), "")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

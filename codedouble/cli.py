@@ -197,7 +197,7 @@ def _decide(log_path, payload, conf):
     return double.resolve(moment_of(payload), rev)
 
 
-def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after="", target=""):
+def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", before="", after="", target="", session_id="", reason="", cwd=""):
     d = os.path.dirname(log_path) or "."
     path = os.path.join(d, "decisions.jsonl")
     try:
@@ -205,11 +205,14 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", be
         with open(path, "a") as f:
             f.write(json.dumps({
                 "ts": time.time(), "event": event, "tool": tool,
+                "session_id": session_id or "",            # scope the panel to ONE session
+                "cwd": cwd or "",                          # PAIR the panel to the AI session in this folder
                 "target": (target or "").strip()[:160],   # file / command (for reply correlation)
                 "intent": (intent or "").strip()[:140],
                 "resolution": (dec.resolution or "").strip()[:140],
                 "before": (before or "").strip()[:200],   # what the AI proposed
                 "after": (after or "").strip()[:200],      # the correction the double asked for
+                "reason": (reason or "").strip()[:240],    # codedouble's reply / WHY it was sent back
                 "verdict": verdict,            # inject | allow | ask | deny | answered | shadow | watch
                 "action": dec.action.value, "ask": dec.action.value == "ask",
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
@@ -430,11 +433,15 @@ def _sid_file(log_path, sid, ext):
     return os.path.join(_session_dir(log_path), f"{(sid or 'default')[:64]}{ext}")
 
 
-def _session_note(log_path, sid, prompt):
-    """Incrementally append the user's intent to this session's running notes."""
+def _session_note(log_path, sid, prompt, cwd=None):
+    """Incrementally append the user's intent (and the cwd / project it came from)
+    to this session's running notes — the cwd is what scopes graduation/seeding."""
     try:
+        rec = {"ts": time.time(), "prompt": (prompt or "")[:500]}
+        if cwd:
+            rec["cwd"] = cwd
         with open(_sid_file(log_path, sid, ".jsonl"), "a") as f:
-            f.write(json.dumps({"ts": time.time(), "prompt": (prompt or "")[:500]}) + "\n")
+            f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
 
@@ -449,6 +456,19 @@ _ANCHORS_SYSTEM = (
 )
 
 
+def _heuristic_goal(notes):
+    """A lightweight goal from the opening prompt (it usually frames the task) — so
+    the session goal still shows when the LLM is unavailable (rate-limited/offline)."""
+    for n in notes:
+        t = re.sub(r"\s+", " ", str(n)).strip()
+        if len(t) >= 12:
+            t = re.split(r"(?<=[.!?])\s", t)[0]       # first sentence
+            t = re.split(r"\s+at\s+[~/]", t)[0]        # drop "... at /a/path"
+            t = re.sub(r"\s*\([^)]*\)", "", t)         # drop parentheticals
+            return t.strip(" .,:")[:140]
+    return ""
+
+
 def _consolidate(notes):
     """Distil running notes into structured ANCHORS (JSON). Local LLM if available;
     a minimal extractive anchor set otherwise."""
@@ -459,7 +479,7 @@ def _consolidate(notes):
         json.loads(out)                       # validate
         return out
     except Exception:
-        return json.dumps({"goal": "", "constraints": [], "decisions": [],
+        return json.dumps({"goal": _heuristic_goal(notes), "constraints": [], "decisions": [],
                            "todos": [n[:160] for n in notes[-8:]], "avoid": []})
 
 
@@ -475,55 +495,303 @@ def _render_anchors(a):
     return "\n".join(parts)[:1600]
 
 
-def _global_anchors_path(log_path):
-    return os.path.join(os.path.dirname(log_path) or ".", "anchors.global.json")
+def _repo_root(start):
+    """Nearest ancestor of `start` containing .git, else `start` itself. The stable
+    per-PROJECT identity. Pure-Python walk-up — no subprocess on the hook hot path."""
+    try:
+        cur = os.path.abspath(start or ".")
+    except Exception:
+        return ""
+    here = cur
+    while True:
+        if os.path.isdir(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return here
+        cur = parent
 
 
-def _merge_global(log_path, a):
-    """Graduate a session's durable anchors (constraints / decisions / avoid) into
-    the cross-session GLOBAL anchors — the local→over-time bridge. Union+dedupe
-    (an LLM dedupe could refine this later)."""
+def _scope_key(cwd):
+    """Stable per-PROJECT bucket key (repo root of cwd). Separating anchors by
+    PROJECT — not by ephemeral session id — keeps cross-session learning WITHIN a
+    project while making cross-domain contamination structurally impossible: another
+    project's anchors live in another bucket and can never be seeded here."""
+    root = _repo_root(cwd) if cwd else ""
+    if not root:
+        return "default"
+    # the project's own path IS the separation key — readable, deterministic, and
+    # unique per project, so two domains never share a bucket.
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", root.strip("/")) or "default"
+
+
+def _scope_anchors_path(log_path, scope):
+    """Per-project durable-anchor file: <store>/anchors/<scope>.json."""
+    d = os.path.join(os.path.dirname(log_path) or ".", "anchors")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, f"{scope or 'default'}.json")
+
+
+def _global_distill_path(log_path):
+    """The single GLOBAL distill — durable rules that recur across projects."""
+    return os.path.join(os.path.dirname(log_path) or ".", "anchors", "__global__.json")
+
+
+def _promote_global(log_path, min_projects=2):
+    """Promote durable rules that RECUR across >= min_projects project distills into
+    the one global distill. A project-specific rule (e.g. one project's include
+    paths) appears in a single bucket and stays local; only genuinely cross-cutting
+    habits globalize. Goal/decisions never globalize (session/project scoped)."""
+    import glob as _glob
+    d = os.path.join(os.path.dirname(log_path) or ".", "anchors")
+    out = {}
+    for key in ("constraints", "avoid"):
+        texts, projects = {}, {}            # token-sig -> longest text / set(project files)
+        for f in _glob.glob(os.path.join(d, "*.json")):
+            if os.path.basename(f).startswith("__"):
+                continue                    # skip the global distill itself
+            try:
+                g = json.loads(open(f).read())
+            except Exception:
+                continue
+            for item in (g.get(key) or []):
+                sig = frozenset(_anchor_tokens(item))
+                if not sig:
+                    continue
+                projects.setdefault(sig, set()).add(f)
+                if len(item) > len(texts.get(sig, "")):
+                    texts[sig] = item
+        promoted = _dedupe_anchors([texts[s] for s in texts
+                                    if len(projects[s]) >= min_projects])
+        if promoted:
+            out[key] = promoted[-24:]
+    gpath = _global_distill_path(log_path)
+    try:
+        tmp = gpath + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps(out))
+        os.replace(tmp, gpath)
+    except Exception:
+        pass
+
+
+_ANCHOR_STOP = {
+    "the", "and", "for", "with", "use", "all", "any", "only", "not", "are", "was",
+    "you", "your", "its", "this", "that", "these", "those", "must", "should",
+}
+
+
+def _stem(w):
+    """Crude morphological fold so run/runs, simulate/simulation/simulations,
+    guess/guessing collapse to one token — enough for near-dup detection."""
+    for suf in ("ations", "ation", "ings", "ing", "ed", "es", "s"):
+        if len(w) > len(suf) + 2 and w.endswith(suf):
+            return w[: -len(suf)]
+    return w
+
+
+def _anchor_tokens(s):
+    """Distinctive, lightly-stemmed tokens of an anchor (drops tiny/stopwords)."""
+    return [_stem(w) for w in re.findall(r"[a-z0-9]+", str(s).lower())
+            if len(w) >= 3 and w not in _ANCHOR_STOP]
+
+
+def _anchor_sig(s):
+    return frozenset(_anchor_tokens(s))
+
+
+def _dedupe_anchors(items, thresh=0.7):
+    """Collapse exact / substring / high-overlap (Jaccard>=thresh) near-duplicates,
+    preferring the more complete phrasing. Deterministic — catches the
+    path/flag/paraphrase pile-up that exact-match dedup let through, and drops
+    truncated fragments (a substring of a kept item). Semantic paraphrase families
+    that share little vocabulary are left for the LLM pass."""
+    kept = []  # (text, sig)
+    for raw in items:
+        s = re.sub(r"\s+", " ", str(raw)).strip()
+        if not s:
+            continue
+        sig = _anchor_sig(s)
+        sl = s.lower()
+        hit = None
+        for i, (t, tsig) in enumerate(kept):
+            tl = t.lower()
+            if sl == tl or sl in tl or tl in sl:
+                hit = i; break
+            if sig and tsig:
+                inter = len(sig & tsig)
+                if not inter:
+                    continue
+                jaccard = inter / len(sig | tsig)
+                # containment catches paraphrases where one anchor's content is
+                # ~subsumed by the other ("do real runs, no simulation" vs "real
+                # runs only — no simulation or guessing") — Jaccard alone misses these.
+                contain = inter / min(len(sig), len(tsig))
+                if jaccard >= thresh or (inter >= 3 and contain >= 0.8):
+                    hit = i; break
+        if hit is None:
+            kept.append((s, sig))
+        elif len(s) > len(kept[hit][0]):       # keep the more complete phrasing
+            kept[hit] = (s, sig)
+    return [t for t, _ in kept]
+
+
+_DEDUPE_SYSTEM = (
+    "You are consolidating a list of durable {kind} accumulated across many coding "
+    "sessions. Collapse near-duplicates and paraphrases into ONE crisp line each, "
+    "drop truncated or garbled fragments, and keep only genuinely distinct items. "
+    "Preserve the EXACT text of any file paths, flags, or commands. "
+    'Return ONLY JSON: {{"items": ["...", "..."]}}.'
+)
+
+
+def _llm_dedupe_anchors(items, kind):
+    """Best-effort semantic consolidation (collapses paraphrase families like
+    'real runs only' vs 'do real runs, no simulation' that lexical dedup can't).
+    HARD, session-wide -> remote tier; falls back to the heuristic result."""
+    if len(items) < 4:
+        return items
+    try:
+        from .backends import llm_complete
+        out = llm_complete(json.dumps(items), system=_DEDUPE_SYSTEM.format(kind=kind),
+                           json_mode=True, timeout=60, prefer="remote")
+        arr = json.loads(out)
+        if isinstance(arr, dict):
+            arr = arr.get("items") or next((v for v in arr.values() if isinstance(v, list)), [])
+        cleaned = [str(x).strip() for x in arr if str(x).strip()]
+        return cleaned if cleaned else items
+    except Exception:
+        return items
+
+
+def _merge_project_distill(log_path, a, scope="default"):
+    """Graduate a session's durable CONSTRAINTS/DECISIONS/AVOID into its PROJECT
+    distill (goal-free: a goal is session-only, since drift is per-conversation).
+    Heuristic + best-effort LLM dedupe so paraphrases don't pile up; the global
+    tier is built separately by _promote_global."""
     if not isinstance(a, dict):
         return
-    gp = _global_anchors_path(log_path)
+    gp = _scope_anchors_path(log_path, scope)
     try:
         g = json.loads(open(gp).read()) if os.path.exists(gp) else {}
     except Exception:
         g = {}
     for key in ("constraints", "decisions", "avoid"):
-        seen = {str(x).strip().lower() for x in (g.get(key) or [])}
-        merged = list(g.get(key) or [])
-        for x in (a.get(key) or []):
-            s = str(x).strip()
-            if s and s.lower() not in seen:
-                merged.append(x); seen.add(s.lower())
-        g[key] = merged[-40:]
-    if a.get("goal") and not g.get("goal"):
-        g["goal"] = a["goal"]
+        combined = list(g.get(key) or []) + list(a.get(key) or [])
+        merged = _llm_dedupe_anchors(_dedupe_anchors(combined), key)
+        g[key] = merged[-24:]
+    # goal is SESSION-ONLY: it never enters a distill tier (drift is per-conversation)
     try:
-        with open(gp, "w") as f:
+        tmp = gp + ".tmp"
+        with open(tmp, "w") as f:
             f.write(json.dumps(g))
+        os.replace(tmp, gp)         # atomic — the live hooks graduate concurrently
     except Exception:
         pass
 
 
+def _session_scope(log_path, sid):
+    """The PROJECT scope this session belongs to — derived from the cwd recorded in
+    its notes (most recent wins). Lets graduation and seeding stay per-project."""
+    cwd = ""
+    try:
+        for l in open(_sid_file(log_path, sid, ".jsonl")).readlines()[-20:]:
+            c = json.loads(l).get("cwd")
+            if c:
+                cwd = c
+    except Exception:
+        pass
+    return _scope_key(cwd)
+
+
+def _seed_from_scope(log_path, scope, per_key=8):
+    """PRIME a fresh session from the DISTILL tiers: this PROJECT's distill plus the
+    GLOBAL distill (constraints/avoid), deduped. NEVER a goal — a goal is session-only
+    (the session grows its own from its own prompts), so no foreign goal can leak in.
+    Project-specific decisions seed too; another project's items never do."""
+    def _load(p):
+        try:
+            return json.loads(open(p).read()) if os.path.exists(p) else {}
+        except Exception:
+            return {}
+    proj = _load(_scope_anchors_path(log_path, scope))
+    glob = _load(_global_distill_path(log_path))
+    out = {}
+    for key in ("constraints", "avoid"):
+        merged = _dedupe_anchors(list(proj.get(key) or []) + list(glob.get(key) or []))
+        if merged:
+            out[key] = merged[:per_key]
+    if proj.get("decisions"):
+        out["decisions"] = (proj.get("decisions") or [])[:per_key]
+    return _render_anchors(out) if out else ""
+
+
 def _session_anchors(log_path, sid):
-    """Anchors (rendered) for steering. The session's own anchors if consolidated;
-    else SEED from the durable global anchors so a fresh session starts primed
-    (over-time→local), not blank."""
+    """Anchors (rendered) for steering. The session's OWN anchors if consolidated
+    (verbatim, incl. its goal); else SEED the domain-relevant slice of the durable
+    global anchors so a fresh session starts primed (over-time→local), not blank —
+    and never inherits another project's anchors."""
     try:
         ap = _sid_file(log_path, sid, ".anchors.json")
         if os.path.exists(ap):
             return _render_anchors(json.loads(open(ap).read()))
     except Exception:
         pass
+    return _seed_from_scope(log_path, _session_scope(log_path, sid))
+
+
+def _session_anchors_struct(log_path, sid):
+    """The session's OWN structured anchors (dict) — the drift reference. Only the
+    session's own (seeded distills carry no goal); {} if not consolidated yet."""
     try:
-        gp = _global_anchors_path(log_path)
-        if os.path.exists(gp):
-            return _render_anchors(json.loads(open(gp).read()))
+        ap = _sid_file(log_path, sid, ".anchors.json")
+        if os.path.exists(ap):
+            return json.loads(open(ap).read())
     except Exception:
         pass
-    return ""
+    return {}
+
+
+_DRIFT_SYSTEM = (
+    "You are a guardrail watching ONE coding session for DRIFT. Given the session's "
+    "GOAL, hard CONSTRAINTS, DECISIONS already made, and approaches to AVOID, then the "
+    "action the AI is about to take, decide if the action DRIFTS: it works toward "
+    "something other than the goal, breaks a constraint, contradicts a decision, or does "
+    "something on the avoid list. Be conservative \u2014 setup/exploration that plausibly "
+    "serves the goal is NOT drift. Return ONLY JSON: "
+    '{"drift": true|false, "reason": "<one line>", "redirect": "<what to do instead>"}.'
+)
+
+
+def _drift_check(anchors, request, diff=""):
+    """Is the AI's action drifting from THIS session's established anchors? Cheap
+    deterministic avoid-list hit first (free), then a best-effort LLM judge (frequent
+    per-action -> local model first). Returns (is_drift, reason, redirect).
+    Conservative: with no established goal it never flags, so the double never blocks
+    legitimate exploration (act on evidence, not ignorance)."""
+    if not isinstance(anchors, dict) or not anchors.get("goal"):
+        return (False, "", "")
+    action = (str(request) + "\n" + str(diff)).strip()
+    asig = _anchor_sig(action)
+    for av in (anchors.get("avoid") or []):
+        sig = _anchor_sig(av)
+        if sig and len(asig & sig) >= max(2, int(round(0.6 * len(sig)))):
+            return (True, "on the avoid list: " + str(av), "avoid this: " + str(av))
+    try:
+        from .backends import llm_complete
+        prompt = ("GOAL: %s\nCONSTRAINTS: %s\nDECISIONS: %s\nAVOID: %s\n\nACTION:\n%s" % (
+            anchors.get("goal", ""), anchors.get("constraints") or [],
+            anchors.get("decisions") or [], anchors.get("avoid") or [], action[:1200]))
+        d = json.loads(llm_complete(prompt, system=_DRIFT_SYSTEM, json_mode=True,
+                                    timeout=30, prefer="local"))
+        if isinstance(d, dict) and d.get("drift"):
+            return (True, str(d.get("reason", ""))[:200], str(d.get("redirect", ""))[:200])
+    except Exception:
+        pass
+    return (False, "", "")
 
 
 def _session_summary(log_path, sid):
@@ -553,12 +821,26 @@ def cmd_summarize(args):
             continue
         anchors_json = _consolidate(notes)
         try:
-            with open(notes_path[:-6] + ".anchors.json", "w") as f:
-                f.write(anchors_json)
-            _merge_global(args.log, json.loads(anchors_json))     # graduate -> global (over-time)
+            a = json.loads(anchors_json)
+            sid = os.path.basename(notes_path)[:-6]
+            apath = notes_path[:-6] + ".anchors.json"
+            # don't let a fallback consolidation (LLM down -> empty goal) WIPE a known
+            # goal/constraints; carry forward the prior ones when the new pass is empty.
+            try:
+                prev = json.loads(open(apath).read())
+            except Exception:
+                prev = {}
+            for k in ("goal", "constraints", "decisions"):
+                if not a.get(k) and prev.get(k):
+                    a[k] = prev[k]
+            scope = _session_scope(args.log, sid)
+            with open(apath, "w") as f:
+                f.write(json.dumps(a))
+            _merge_project_distill(args.log, a, scope)   # graduate -> project bucket
             n += 1
         except Exception:
             pass
+    _promote_global(args.log)              # recurring rules -> the global distill
     if not args.quiet:
         print(f"summarized {n} session(s)")
 
@@ -612,12 +894,14 @@ def cmd_hook(args):
 
         if name == "UserPromptSubmit":
             prompt = ev.get("prompt", "")
+            cwd = ev.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or ""    # project scope
             _capture_correction(args.log, prompt, ev.get("transcript_path"))   # learn from "no, I meant X"
-            _session_note(args.log, ev.get("session_id", ""), prompt)          # incremental session summary
+            _session_note(args.log, ev.get("session_id", ""), prompt, cwd)     # incremental session summary
             dec = _decide(args.log, {"request": prompt, "reversibility": "low"}, args.conf)
             injected = bool(dec.retrieved and dec.confidence >= 0.4 and dec.resolution)
             _log_decision(args.log, name, None, dec, enforce, intent=prompt,
-                          verdict=("inject" if injected else "watch"))
+                          verdict=("inject" if injected else "watch"),
+                          session_id=ev.get("session_id", ""), cwd=ev.get("cwd", ""))
             if _DECISION_RE.search(prompt):
                 _maybe_reflect(args.log, summarize=True)      # a decision was made -> re-anchor
             blocks = []
@@ -668,6 +952,18 @@ def cmd_hook(args):
                               f"do this instead: {after}")
                 else:
                     verdict = "allow"         # unknown or known-good -> let it through
+            # DRIFT (opt-in, CODEDOUBLE_DRIFT=1): is the AI straying from THIS session's
+            # established goal / constraints / decisions / avoid? Acts on the developer's
+            # behalf TOWARD the AI — sends it back to re-align, never prompts the developer.
+            if enforce and verdict == "allow" and os.environ.get("CODEDOUBLE_DRIFT") == "1":
+                anchors = _session_anchors_struct(args.log, ev.get("session_id", ""))
+                is_drift, dreason, dredirect = _drift_check(
+                    anchors, payload["request"], payload.get("diff", ""))
+                if is_drift:
+                    verdict = "deny"
+                    after = dredirect or "Re-align with the session goal."
+                    reason = (f"[codedouble] (on the developer's behalf) this drifts from the "
+                              f"session goal — {dreason}. Instead: {after}")
             # Optional quality gate (opt-in, Edit/Write only): if the proposed change
             # doesn't meet the intent, reject + paraphrase + send it back to redo.
             if (enforce and verdict == "allow" and tool in ("Edit", "Write")
@@ -683,7 +979,8 @@ def cmd_hook(args):
                         after = refine or "Redo it to match what was asked, more carefully."
                         reason = f"[codedouble] quality check — this doesn't fully meet the intent. {after}"
             _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"],
-                          verdict=verdict, before=before, after=after, target=target)
+                          verdict=verdict, before=before, after=after, target=target,
+                          session_id=ev.get("session_id", ""), reason=reason, cwd=ev.get("cwd", ""))
             if verdict == "deny":
                 _maybe_reflect(args.log)       # a send-back matters -> reflect now
             if enforce:
