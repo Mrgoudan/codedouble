@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # codedouble — frictionless, idempotent setup. Safe to re-run.
 #
-#   ./setup.sh                 # shadow mode (observe only; nothing blocked)
-#   ./setup.sh --enforce       # the double acts on your behalf (sends the AI back)
-#   ./setup.sh --enforce --qc  # + LLM drift/quality check on edits
+#   ./setup.sh            # DEFAULT: enforce + QC (acts on your behalf + LLM drift-check)
+#   ./setup.sh --no-qc    # act (send-back), but skip the LLM drift-check
+#   ./setup.sh --shadow   # observe only — nothing blocked
 #
 # Installs the package, the local model (cheap tier), the VS Code panel, and wires
 # the Claude Code hooks. Each step is optional and skipped cleanly if its tool is absent.

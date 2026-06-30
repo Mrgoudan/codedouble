@@ -773,9 +773,12 @@ def cmd_setup(args):
         d = {}
     if os.path.exists(sp):
         shutil.copy(sp, sp + ".codedouble-setup.bak")
+    # DEFAULT is full: enforce + QC. Opt out with --shadow / --no-enforce / --no-qc.
+    enforce = not (args.shadow or getattr(args, "no_enforce", False))
+    qc = enforce and not (args.shadow or getattr(args, "no_qc", False))
     hooks = d.setdefault("hooks", {})
-    pre = ("CODEDOUBLE_ENFORCE=1 " if args.enforce else "") + \
-          ("CODEDOUBLE_QC=1 " if args.qc else "") + "python3 -m codedouble.cli hook"
+    pre = ("CODEDOUBLE_ENFORCE=1 " if enforce else "") + \
+          ("CODEDOUBLE_QC=1 " if qc else "") + "python3 -m codedouble.cli hook"
 
     def ensure(event, matcher, command):
         arr = hooks.setdefault(event, [])
@@ -799,7 +802,7 @@ def cmd_setup(args):
         print(f"  hooks -> {sp}: " + ", ".join(f"{k} {v}" for k, v in r.items()))
     except Exception as e:
         print("  could not write settings:", e)
-    print(f"  mode: {'ENFORCE' if args.enforce else 'shadow'}{' + QC' if args.qc else ''}. "
+    print(f"  mode: {'ENFORCE' if enforce else 'shadow'}{' + QC' if qc else ''}. "
           "Start a new Claude Code session to load the hooks.")
 
 
@@ -867,8 +870,9 @@ def main(argv=None):
 
     p = sub.add_parser("setup", help="frictionless: wire Claude Code hooks + store + LLM-port template")
     p.add_argument("--settings", default="~/.claude/settings.json")
-    p.add_argument("--enforce", action="store_true", help="gate acts (send-back), not just shadow")
-    p.add_argument("--qc", action="store_true", help="LLM quality/drift check on edits")
+    p.add_argument("--shadow", action="store_true", help="observe only (default is enforce + QC)")
+    p.add_argument("--no-enforce", dest="no_enforce", action="store_true", help="don't send back; observe")
+    p.add_argument("--no-qc", dest="no_qc", action="store_true", help="skip the LLM drift/quality check")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("summarize", help="consolidate each session's running notes into an intent summary (run on idle)")
