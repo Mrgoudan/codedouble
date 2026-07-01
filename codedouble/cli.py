@@ -18,6 +18,7 @@ import re
 import stat
 import sys
 
+import hashlib
 import json
 import os
 import sys
@@ -308,10 +309,6 @@ _CORRECTION_RE = re.compile(
     r"(i meant|i mean\b|you mis|misunderstood|understood me|that'?s not|not what i|"
     r"you'?re wrong|you got it wrong|instead of|rather than|the point is|i said\b)", re.I)
 
-# a decision being made is also a moment that matters -> re-anchor
-_DECISION_RE = re.compile(
-    r"\b(let'?s\b|go with|we'?ll\b|we will\b|decided|the plan is|stick with|going with|finali[sz]e)\b", re.I)
-
 
 def _last_assistant_text(transcript_path):
     """Best-effort: the AI's previous turn (what the correction is aimed at)."""
@@ -446,16 +443,6 @@ def _session_note(log_path, sid, prompt, cwd=None):
         pass
 
 
-_ANCHORS_SYSTEM = (
-    "Extract the durable ANCHORS of this coding session from the developer's prompts. "
-    "Return ONLY JSON: {\"goal\": \"<the end goal in one sentence>\", "
-    "\"constraints\": [hard requirements that must hold], "
-    "\"decisions\": [decisions already made — do NOT re-litigate], "
-    "\"todos\": [open tasks still to do], \"avoid\": [approaches they rejected]}. "
-    "Each item one short line; omit empties."
-)
-
-
 def _heuristic_goal(notes):
     """A lightweight goal from the opening prompt (it usually frames the task) — so
     the session goal still shows when the LLM is unavailable (rate-limited/offline)."""
@@ -469,18 +456,57 @@ def _heuristic_goal(notes):
     return ""
 
 
-def _consolidate(notes):
-    """Distil running notes into structured ANCHORS (JSON). Local LLM if available;
-    a minimal extractive anchor set otherwise."""
-    text = "\n".join(f"- {n}" for n in notes[-50:])
+_ANCHOR_KEYS = ("goal", "constraints", "decisions", "todos", "avoid")
+
+_UPDATE_SYSTEM = (
+    "You maintain the ANCHORS of a coding session as it evolves. You are given the "
+    "CURRENT anchors (JSON) and the developer's NEW message(s). Return the UPDATED anchors "
+    "as JSON with EXACTLY these keys: {\"goal\": \"<one sentence>\", \"constraints\": [], "
+    "\"decisions\": [], \"todos\": [], \"avoid\": []}. Apply the SMALLEST edit that "
+    "reflects the new messages: ADD a constraint/decision/todo/avoid only when a message "
+    "introduces one; UPDATE (rewrite in place) an item a message refines or corrects; "
+    "DELETE an item a message supersedes, contradicts, completes, or resolves; keep the "
+    "goal unchanged unless a message clearly changes the overall goal. If the new messages "
+    "change nothing (acknowledgement, question, chit-chat), return the CURRENT anchors "
+    "unchanged. Each item one short line, grounded in the messages; never invent content."
+)
+
+
+def _norm_anchors(a, fallback=None):
+    """Coerce an anchors dict to the canonical shape; fall back per-key on bad values."""
+    fb = fallback or {}
+    out = {"goal": str(a.get("goal") or fb.get("goal") or "")}
+    for k in ("constraints", "decisions", "todos", "avoid"):
+        v = a.get(k)
+        out[k] = ([str(x).strip() for x in v if str(x).strip()][:12]
+                  if isinstance(v, list) else list(fb.get(k) or []))
+    return out
+
+
+def _update_anchors(current, new_messages):
+    """Mem0-style INCREMENTAL anchor maintenance: given the current anchors and ONLY the
+    NEW messages, edit in place (add / update / delete / noop) — never re-derive from full
+    history. Local model first (cheap, per-turn). Returns (anchors, ok): ok=False when the
+    LLM was unreachable, so the caller keeps those notes unprocessed and retries later
+    (current anchors are preserved — a fallback pass never wipes them)."""
+    msgs = [str(m).strip() for m in (new_messages or [])
+            if str(m).strip() and str(m).strip()[:1] != "<"]     # drop IDE/system notices
+    cur = {k: current.get(k) for k in _ANCHOR_KEYS}
+    if not msgs:
+        return _norm_anchors(cur), True
     try:
-        from .backends import llm_complete                       # HARD, session-wide -> remote (GLM)
-        out = llm_complete(text, system=_ANCHORS_SYSTEM, json_mode=True, timeout=90, prefer="remote")
-        json.loads(out)                       # validate
-        return out
+        from .backends import llm_complete
+        out = llm_complete(json.dumps({"current": cur, "new_messages": msgs}),
+                           system=_UPDATE_SYSTEM, json_mode=True, timeout=60, prefer="local")
+        a = json.loads(out)
+        if isinstance(a, dict):
+            return _norm_anchors(a, fallback=cur), True
     except Exception:
-        return json.dumps({"goal": _heuristic_goal(notes), "constraints": [], "decisions": [],
-                           "todos": [n[:160] for n in notes[-8:]], "avoid": []})
+        pass
+    kept = _norm_anchors(cur, fallback=cur)
+    if not kept["goal"]:
+        kept["goal"] = _heuristic_goal(msgs)                     # show a goal even offline
+    return kept, False
 
 
 def _render_anchors(a):
@@ -520,9 +546,11 @@ def _scope_key(cwd):
     root = _repo_root(cwd) if cwd else ""
     if not root:
         return "default"
-    # the project's own path IS the separation key — readable, deterministic, and
-    # unique per project, so two domains never share a bucket.
-    return re.sub(r"[^A-Za-z0-9_.-]", "-", root.strip("/")) or "default"
+    # readable base + a hash of the FULL path so distinct paths never collide to one
+    # bucket (e.g. /a/b vs /a-b) and the name stays filesystem-bounded.
+    base = re.sub(r"[^A-Za-z0-9_.-]", "-", root.strip("/"))
+    h = hashlib.sha1(root.encode("utf-8")).hexdigest()[:8]
+    return (base[:80] + "-" + h) if base else "default"
 
 
 def _scope_anchors_path(log_path, scope):
@@ -551,14 +579,19 @@ def _promote_global(log_path, min_projects=2):
     for key in ("constraints", "avoid"):
         texts, projects = {}, {}            # token-sig -> longest text / set(project files)
         for f in _glob.glob(os.path.join(d, "*.json")):
-            if os.path.basename(f).startswith("__"):
+            if os.path.basename(f) == "__global__.json":
                 continue                    # skip the global distill itself
             try:
                 g = json.loads(open(f).read())
             except Exception:
                 continue
-            for item in (g.get(key) or []):
-                sig = frozenset(_anchor_tokens(item))
+            items = g.get(key)
+            if not isinstance(items, list):
+                continue                    # tolerate a malformed/partial distill file
+            for item in items:
+                if not isinstance(item, str):
+                    continue
+                sig = _anchor_sig(item)
                 if not sig:
                     continue
                 projects.setdefault(sig, set()).add(f)
@@ -776,9 +809,14 @@ def _drift_check(anchors, request, diff=""):
         return (False, "", "")
     action = (str(request) + "\n" + str(diff)).strip()
     asig = _anchor_sig(action)
+    act = re.sub(r"\s+", " ", action.lower())
     for av in (anchors.get("avoid") or []):
         sig = _anchor_sig(av)
-        if sig and len(asig & sig) >= max(2, int(round(0.6 * len(sig)))):
+        avn = re.sub(r"\s+", " ", str(av).lower()).strip()
+        # high-precision: the avoid PHRASE literally appears (catches short avoids the
+        # token test alone misses, e.g. an echo of "use global state"), OR a >=3-token
+        # paraphrase overlap. Avoids BOTH the false positives and the short-avoid dead zone.
+        if (len(avn) >= 8 and avn in act) or len(asig & sig) >= 3:
             return (True, "on the avoid list: " + str(av), "avoid this: " + str(av))
     try:
         from .backends import llm_complete
@@ -808,8 +846,10 @@ def _session_summary(log_path, sid):
 
 
 def cmd_summarize(args):
-    """Consolidate each session's running notes into a compact intent summary
-    (local LLM if available; extractive fallback). Run on idle. Idempotent."""
+    """Maintain each active session's ANCHORS incrementally — Mem0-style add/update/
+    delete/noop over ONLY the new notes since last update (tracked by `_n`), not a
+    re-derivation from full history. Local model; preserves anchors on LLM failure and
+    retries the unprocessed notes later. Idempotent; run coalesced/detached."""
     import glob
     n = 0
     for notes_path in glob.glob(os.path.join(_session_dir(args.log), "*.jsonl")):
@@ -819,30 +859,28 @@ def cmd_summarize(args):
             continue
         if not notes:
             continue
-        anchors_json = _consolidate(notes)
+        apath = notes_path[:-6] + ".anchors.json"
         try:
-            a = json.loads(anchors_json)
-            sid = os.path.basename(notes_path)[:-6]
-            apath = notes_path[:-6] + ".anchors.json"
-            # don't let a fallback consolidation (LLM down -> empty goal) WIPE a known
-            # goal/constraints; carry forward the prior ones when the new pass is empty.
-            try:
-                prev = json.loads(open(apath).read())
-            except Exception:
-                prev = {}
-            for k in ("goal", "constraints", "decisions"):
-                if not a.get(k) and prev.get(k):
-                    a[k] = prev[k]
-            scope = _session_scope(args.log, sid)
+            cur = json.loads(open(apath).read())
+        except Exception:
+            cur = {}
+        processed = int(cur.get("_n") or 0)
+        new = notes[processed:]
+        if not new:
+            continue                      # no new notes -> skip (exact count, no mtime race)
+        updated, ok = _update_anchors(cur, new)
+        updated["_n"] = len(notes) if ok else processed   # advance only when the LLM ran
+        sid = os.path.basename(notes_path)[:-6]
+        try:
             with open(apath, "w") as f:
-                f.write(json.dumps(a))
-            _merge_project_distill(args.log, a, scope)   # graduate -> project bucket
+                f.write(json.dumps(updated))
+            _merge_project_distill(args.log, updated, _session_scope(args.log, sid))
             n += 1
         except Exception:
             pass
     _promote_global(args.log)              # recurring rules -> the global distill
     if not args.quiet:
-        print(f"summarized {n} session(s)")
+        print(f"updated {n} session(s)")
 
 
 def cmd_gate(args):
@@ -891,19 +929,21 @@ def cmd_hook(args):
     try:
         name = ev.get("hook_event_name", "")
         enforce = os.environ.get("CODEDOUBLE_ENFORCE") == "1"
+        cwd = ev.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or ""    # project scope (both paths)
 
         if name == "UserPromptSubmit":
             prompt = ev.get("prompt", "")
-            cwd = ev.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or ""    # project scope
             _capture_correction(args.log, prompt, ev.get("transcript_path"))   # learn from "no, I meant X"
             _session_note(args.log, ev.get("session_id", ""), prompt, cwd)     # incremental session summary
             dec = _decide(args.log, {"request": prompt, "reversibility": "low"}, args.conf)
             injected = bool(dec.retrieved and dec.confidence >= 0.4 and dec.resolution)
             _log_decision(args.log, name, None, dec, enforce, intent=prompt,
                           verdict=("inject" if injected else "watch"),
-                          session_id=ev.get("session_id", ""), cwd=ev.get("cwd", ""))
-            if _DECISION_RE.search(prompt):
-                _maybe_reflect(args.log, summarize=True)      # a decision was made -> re-anchor
+                          session_id=ev.get("session_id", ""), cwd=cwd)
+            # maintain the session anchors INCREMENTALLY (Mem0-style add/update/delete/
+            # noop over the new notes) — coalesced >=20s, detached, on the local model.
+            # No importance gate: a trivial turn is a NOOP; a real change edits in place.
+            _maybe_reflect(args.log, summarize=True)
             blocks = []
             anchors = _session_anchors(args.log, ev.get("session_id", ""))
             if anchors:
@@ -980,7 +1020,7 @@ def cmd_hook(args):
                         reason = f"[codedouble] quality check — this doesn't fully meet the intent. {after}"
             _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"],
                           verdict=verdict, before=before, after=after, target=target,
-                          session_id=ev.get("session_id", ""), reason=reason, cwd=ev.get("cwd", ""))
+                          session_id=ev.get("session_id", ""), reason=reason, cwd=cwd)
             if verdict == "deny":
                 _maybe_reflect(args.log)       # a send-back matters -> reflect now
             if enforce:

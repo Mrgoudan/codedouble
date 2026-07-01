@@ -151,18 +151,13 @@ function decisionsPath(): string {
 }
 
 interface Panel {
-  watching: number;   // interactions captured passively (all repos)
-  goal: string;       // this session's overall goal (from its anchors)
-  repos: number;
-  learned: number;    // distilled preference rules (from reflection)
-  reactions: Array<{ k: string; v: number }>;                 // your reactions, by kind
-  overrides: Array<{ file: string; from: string; to: string; rel: string }>;  // override detail
-  seen: number;       // AI actions the double weighed in on
-  handled: number;    // let through, on your behalf
-  rejected: number;   // sent back to the AI to redo
-  interceptRate: number;
+  goal: string;         // this session's overall goal (from its anchors)
+  constraints: string[]; // the session's steering anchors (same block injected to the AI)
+  decisions: string[];
+  todos: string[];
+  handled: number;      // let through, on your behalf
+  rejected: number;     // sent back to the AI to redo
   sentBack: Array<{ intent: string; before: string; why: string; rel: string }>;  // AI tried → why sent back
-  recent: Array<{ intent: string; resolution: string; tag: string; conf: number; n: number; rel: string }>;
 }
 
 function shortIntent(s: string, n = 72): string {
@@ -171,33 +166,6 @@ function shortIntent(s: string, n = 72): string {
 }
 
 function readPanel(): Panel {
-  // passive signal: your reactions to AI changes (interactions.jsonl, all repos)
-  let watching = 0; const repos = new Set<string>();
-  const rcounts: Record<string, number> = {};
-  const overrides: Panel["overrides"] = [];
-  try {
-    const recs: Array<Record<string, unknown>> = [];
-    for (const line of fs.readFileSync(logPath(), "utf8").split("\n")) {
-      if (!line.trim()) continue; watching++;
-      try {
-        const r = JSON.parse(line) as Record<string, unknown>;
-        recs.push(r);
-        const oc = String(r.outcome || "?");
-        rcounts[oc] = (rcounts[oc] || 0) + 1;
-        if (r.repo) repos.add(String(r.repo));
-      } catch { /* skip */ }
-    }
-    for (const r of recs.filter((x) => x.outcome === "override").slice(-8).reverse()) {
-      const files = (r.files as string[]) || [];
-      overrides.push({
-        file: String(files[0] || "").split("/").pop() || "",
-        from: shortIntent(String(r.corrected_from || "")),
-        to: shortIntent(String(r.resolution || "")),
-        rel: relTime(Number(r.ts) || 0),
-      });
-    }
-  } catch { /* none yet */ }
-  const reactions = Object.entries(rcounts).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ k, v }));
   // the double's verdicts on your real Claude usage (decisions.jsonl)
   // verdict: inject/allow = handled, ask = checked, deny = rejected (shadow falls back to would-ask)
   // the double acts toward the AI: "sent back" (deny / legacy ask) vs "handled" (let through)
@@ -207,8 +175,8 @@ function readPanel(): Panel {
     if (v === undefined || v === "shadow") return r.ask ? "sent back" : "handled";
     return "handled"; // inject | allow | watch | answered
   };
-  let seen = 0, handled = 0, rejected = 0, goal = "";
-  const recent: Panel["recent"] = [];
+  let handled = 0, rejected = 0, goal = "";
+  const constraints: string[] = [], decisions: string[] = [], todos: string[] = [];
   const sentBack: Panel["sentBack"] = [];
   try {
     const recs = fs.readFileSync(decisionsPath(), "utf8").split("\n")
@@ -235,14 +203,18 @@ function readPanel(): Panel {
       if (v) { sid = v; break; }
     }
     const scoped = sid ? pool.filter((r) => String(r.session_id || "") === sid) : pool;
-    seen = scoped.length;
     // GOAL persists per session: its consolidated goal, else a heuristic from its OWN
     // first prompt (always stored in its notes) — so opening ANY of the folder's
     // sessions shows that session's goal, never another's, even before consolidation.
     const sdir = path.join(path.dirname(logPath()), "sessions");
+    const strs = (v: unknown): string[] =>
+      Array.isArray(v) ? v.map((x) => String(x)).filter(Boolean).slice(0, 8) : [];
     try {
-      if (sid) goal = String((JSON.parse(
-        fs.readFileSync(path.join(sdir, sid + ".anchors.json"), "utf8")) as Record<string, unknown>).goal || "");
+      if (sid) {
+        const a = JSON.parse(fs.readFileSync(path.join(sdir, sid + ".anchors.json"), "utf8")) as Record<string, unknown>;
+        goal = String(a.goal || "");
+        constraints.push(...strs(a.constraints)); decisions.push(...strs(a.decisions)); todos.push(...strs(a.todos));
+      }
     } catch { /* not consolidated yet */ }
     if (!goal && sid) {
       try {
@@ -270,15 +242,7 @@ function readPanel(): Panel {
       }
     }
   } catch { /* gateway not active yet */ }
-  let learned = 0;
-  try {
-    learned = fs.readFileSync(path.join(path.dirname(logPath()), "rules.jsonl"), "utf8")
-      .split("\n").filter((l) => l.trim()).length;
-  } catch { /* not reflected yet */ }
-  return {
-    watching, repos: repos.size, learned, reactions, overrides, seen, handled, rejected,
-    interceptRate: seen ? Math.round((100 * rejected) / seen) : 0, sentBack, recent, goal,
-  };
+  return { goal, constraints, decisions, todos, handled, rejected, sentBack };
 }
 
 function updateStatus(): void {
@@ -406,7 +370,6 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .num{font-size:23px;font-weight:700;line-height:1}.num.pos{color:#3fb950}.num.amber{color:#d29922}.num.red{color:#f85149}
       .clbl{font-size:10px;opacity:.72;margin-top:5px;line-height:1.25}
       h4{margin:15px 0 4px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;opacity:.55}
-      .metric{font-size:23px;font-weight:700}
       ul{list-style:none;padding:0;margin:0}
       li{padding:6px 0;border-top:1px solid var(--vscode-input-background,#80808026)}
       li:first-child{border-top:none}
@@ -416,10 +379,8 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .tag{font-size:9px;text-transform:uppercase;letter-spacing:.03em;padding:1px 6px;border-radius:9px;color:#fff;flex:none}
       .tag.green{background:#3fb950}.tag.amber{background:#d29922}.tag.red{background:#f85149}
       .t{opacity:.7}
-      .rx{margin:7px 0}.rxh{display:flex;align-items:center;gap:6px}
-      .rdot{width:8px;height:8px;border-radius:50%;flex:none}
-      .rk{flex:1}.rn{font-weight:600}
-      .rd{opacity:.6;font-size:10.5px;margin:1px 0 0 14px;line-height:1.35}
+      #anchors h4{margin:11px 0 3px}
+      #anchors li{padding:3px 0;border-top:none;opacity:.85;font-size:11px;line-height:1.4;white-space:normal;word-break:break-word}
       .hint{opacity:.55;font-weight:400;text-transform:none;letter-spacing:0}
       .ba{margin:3px 0 2px 2px;font-size:11px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
       .bf{color:#f85149}.af{color:#3fb950}
@@ -433,6 +394,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
         <b id="state">…</b><span class="grow"></span><span class="sub" id="sess"></span></div>
 
       <div id="goalbox" class="goal"><span class="glbl">this session’s goal</span><span id="goal"></span></div>
+      <div id="anchors"></div>
 
       <div class="lead">Sent back to redo <span class="hint">— this session</span></div>
       <div class="cards">
@@ -458,20 +420,23 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
         const $=id=>document.getElementById(id);
         $('report').onclick=()=>vscode.postMessage({cmd:'openReport'});
         $('dot').onclick=()=>vscode.postMessage({cmd:'toggle'});
+        const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
         addEventListener('message',e=>{const s=e.data;
           $('dot').className='dot '+(s.enabled?'on':'off');
           $('state').textContent=s.enabled?'watching':'paused';
           $('sess').textContent='this session';
           $('goal').textContent=s.goal||'';
           $('goalbox').style.display=s.goal?'block':'none';
+          const sec=(title,items)=>(items&&items.length)?('<h4>'+title+'</h4><ul>'+items.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'):'';
+          $('anchors').innerHTML=sec('Constraints',s.constraints)+sec('Decisions made',s.decisions)+sec('To do',s.todos);
           $('rejected').textContent=s.rejected||0;
           $('handled').textContent=s.handled||0;
           const sb=s.sentBack||[];
           $('sb').style.display=sb.length?'block':'none';
           $('none').style.display=sb.length?'none':'block';
           $('sentback').innerHTML=sb.map(o=>
-            '<li><div class="it"><span class="tag red">sent back</span><span class="iv">'+(o.intent||'?')+'</span><span class="t">'+(o.rel||'')+'</span></div>'+
-            '<div class="ba"><span class="bf">AI: '+(o.before||'?')+'</span><br><span class="af">→ '+(o.why||'redo')+'</span></div></li>').join('');
+            '<li><div class="it"><span class="tag red">sent back</span><span class="iv">'+esc(o.intent||'?')+'</span><span class="t">'+esc(o.rel||'')+'</span></div>'+
+            '<div class="ba"><span class="bf">AI: '+esc(o.before||'?')+'</span><br><span class="af">→ '+esc(o.why||'redo')+'</span></div></li>').join('');
           $('foot').textContent=(s.store||'~/.codedouble');
         });
       </script></body></html>`;

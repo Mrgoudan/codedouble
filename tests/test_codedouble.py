@@ -262,7 +262,8 @@ class TestAnchorGraduation(unittest.TestCase):
         self.assertNotIn("Hunt compiler", seeded)
         self.assertNotIn("Goal:", seeded)            # goal still never seeded
 
-        # a session with no cwd (scope 'default') seeds from neither project
+        # a no-cwd ('default') session shares no bucket with A or B and (no global
+        # distill promoted here) seeds nothing -- a strict, non-vacuous isolation check
         self.cli._session_note(self.log, "sNone", "hello")
         self.assertEqual(self.cli._session_anchors(self.log, "sNone"), "")
 
@@ -327,6 +328,42 @@ class TestAnchorGraduation(unittest.TestCase):
             ["Continue work on codedouble (the Self-Learning Code Double) at /home/x/y (gitee, main). It's an external monitor."])
         self.assertEqual(g, "Continue work on codedouble")
         self.assertEqual(self.cli._heuristic_goal([]), "")
+
+    def test_scope_key_no_collision(self):
+        # '/a/b' and '/a-b' sanitize to the same base — the hash suffix must keep them distinct
+        self.assertNotEqual(self.cli._scope_key("/tmp/a/b"), self.cli._scope_key("/tmp/a-b"))
+        # stable for the same path
+        self.assertEqual(self.cli._scope_key("/tmp/a/b"), self.cli._scope_key("/tmp/a/b"))
+
+    def test_drift_avoid_matching(self):
+        av = {"goal": "x", "avoid": ["use global state"]}
+        # a benign MENTION of a 2-token avoid is NOT drift (no false positive)
+        self.assertFalse(self.cli._drift_check(av, "document the global state machine design", "")[0])
+        # an ECHO of the avoid phrase IS caught (the short-avoid dead zone is fixed)
+        self.assertTrue(self.cli._drift_check(av, "refactor to use global state everywhere", "")[0])
+        # a >=3-token paraphrase fires
+        self.assertTrue(self.cli._drift_check(
+            {"goal": "x", "avoid": ["Using project ID alone as the key for separation"]},
+            "refactor to use the project id alone as the key", "")[0])
+
+    def test_update_anchors_incremental(self):
+        # Mem0-style incremental maintenance: offline NEVER wipes; fresh gets a heuristic
+        # goal; pure IDE-noise is a NOOP. (LLM disabled -> the fallback path.)
+        a, ok = self.cli._update_anchors({"goal": "keep", "constraints": ["c1"]}, ["ok"])
+        self.assertEqual(a["goal"], "keep")            # current preserved on LLM failure
+        self.assertEqual(a["constraints"], ["c1"])
+        self.assertFalse(ok)                           # LLM unreachable -> caller retries later
+        a2, _ = self.cli._update_anchors({}, ["build a parser for the config format"])
+        self.assertTrue(a2["goal"])                    # heuristic goal even offline
+        _, ok3 = self.cli._update_anchors({"goal": "g"}, ["<ide_opened_file> opened x.py"])
+        self.assertTrue(ok3)                           # only IDE-noise -> nothing to process (NOOP)
+
+    def test_norm_anchors_coerces(self):
+        out = self.cli._norm_anchors({"goal": 5, "constraints": "notalist", "todos": [" x ", "", 7]},
+                                     fallback={"constraints": ["fb"]})
+        self.assertEqual(out["goal"], "5")
+        self.assertEqual(out["constraints"], ["fb"])   # non-list -> fallback
+        self.assertEqual(out["todos"], ["x", "7"])     # trimmed/stringified, empties dropped
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
