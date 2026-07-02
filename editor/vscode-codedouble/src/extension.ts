@@ -160,6 +160,13 @@ interface Panel {
   sentBack: Array<{ intent: string; before: string; why: string; rel: string }>;  // AI tried → why sent back
 }
 
+function cleanPrompt(p: unknown): string {
+  // strip injected IDE/system context so it never becomes the session goal
+  return String(p || "")
+    .replace(/<(ide_selection|ide_opened_file|system-reminder|system)\b[^>]*>[\s\S]*?(<\/\1>|$)/gi, " ")
+    .replace(/\s+/g, " ").trim();
+}
+
 function shortIntent(s: string, n = 72): string {
   s = (s || "").replace(/\s+/g, " ").trim();
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
@@ -220,7 +227,7 @@ function readPanel(): Panel {
       try {
         for (const l of fs.readFileSync(path.join(sdir, sid + ".jsonl"), "utf8").split("\n")) {
           if (!l.trim()) continue;
-          const p = String((JSON.parse(l) as Record<string, unknown>).prompt || "").replace(/\s+/g, " ").trim();
+          const p = cleanPrompt((JSON.parse(l) as Record<string, unknown>).prompt);
           if (p.length >= 12) {
             goal = p.split(/(?<=[.!?])\s/)[0].split(/\s+at\s+[~/]/)[0].replace(/\s*\([^)]*\)/g, "").trim().slice(0, 140);
             break;

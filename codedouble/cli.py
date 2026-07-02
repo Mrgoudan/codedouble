@@ -443,11 +443,27 @@ def _session_note(log_path, sid, prompt, cwd=None):
         pass
 
 
+# injected IDE/system context ("<ide_selection>...", "<ide_opened_file>...",
+# "<system-reminder>...") is NOT the developer's intent — strip it so it can never
+# become a goal/anchor ("goal will never be a selection"). Closed blocks are removed
+# in place; an unclosed/truncated block is stripped to end.
+_INJECTED_RE = re.compile(
+    r"<(ide_selection|ide_opened_file|system-reminder|system)\b[^>]*>.*?(</\1>|$)", re.I | re.S)
+
+
+def _clean_prompt(text):
+    # drop a re-pasted anchors block (the injected "[codedouble] Session anchors ..."
+    # context) — keep only the developer's own words before it. This is what leaked
+    # another task's anchors (F40) into an unrelated session.
+    t = re.split(r"\[codedouble\] Session anchors", str(text or ""))[0]
+    return re.sub(r"\s+", " ", _INJECTED_RE.sub(" ", t)).strip()
+
+
 def _heuristic_goal(notes):
     """A lightweight goal from the opening prompt (it usually frames the task) — so
     the session goal still shows when the LLM is unavailable (rate-limited/offline)."""
     for n in notes:
-        t = re.sub(r"\s+", " ", str(n)).strip()
+        t = _clean_prompt(n)                           # drop injected IDE/system noise
         if len(t) >= 12:
             t = re.split(r"(?<=[.!?])\s", t)[0]       # first sentence
             t = re.split(r"\s+at\s+[~/]", t)[0]        # drop "... at /a/path"
@@ -489,8 +505,7 @@ def _update_anchors(current, new_messages):
     history. Local model first (cheap, per-turn). Returns (anchors, ok): ok=False when the
     LLM was unreachable, so the caller keeps those notes unprocessed and retries later
     (current anchors are preserved — a fallback pass never wipes them)."""
-    msgs = [str(m).strip() for m in (new_messages or [])
-            if str(m).strip() and str(m).strip()[:1] != "<"]     # drop IDE/system notices
+    msgs = [c for m in (new_messages or []) if (c := _clean_prompt(m))]   # strip IDE/system noise
     cur = {k: current.get(k) for k in _ANCHOR_KEYS}
     if not msgs:
         return _norm_anchors(cur), True

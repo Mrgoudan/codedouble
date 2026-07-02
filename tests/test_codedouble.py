@@ -346,6 +346,18 @@ class TestAnchorGraduation(unittest.TestCase):
             {"goal": "x", "avoid": ["Using project ID alone as the key for separation"]},
             "refactor to use the project id alone as the key", "")[0])
 
+    def test_clean_prompt_strips_injected_context(self):
+        # a goal is NEVER an IDE selection / system notice (real reported bug)
+        sel = ("<ide_selection>The user selected lines 46-60 from /x/bug.cbs: "
+               "#include <stdio.h></ide_selection> fix the null deref in parse()")
+        self.assertEqual(self.cli._clean_prompt("<ide_opened_file>opened x.py</ide_opened_file>"), "")
+        self.assertIn("fix the null deref", self.cli._clean_prompt(sel))
+        self.assertNotIn("ide_selection", self.cli._clean_prompt(sel))
+        # unclosed/truncated block -> stripped to end
+        self.assertEqual(self.cli._clean_prompt("<ide_selection>The user selected lines 46-60 from /x"), "")
+        # the derived goal is the real intent, not the selection
+        self.assertEqual(self.cli._heuristic_goal([sel]).lower()[:3], "fix")
+
     def test_update_anchors_incremental(self):
         # Mem0-style incremental maintenance: offline NEVER wipes; fresh gets a heuristic
         # goal; pure IDE-noise is a NOOP. (LLM disabled -> the fallback path.)
