@@ -1,3 +1,5 @@
+> ⚠️ **Stale translation / 过时的翻译** — this file describes an earlier design and is kept for reference only. The canonical, current documentation is **[README.md](README.md)** (English).
+
 # 自学习代码分身（The Self-Learning Code Double）
 
 一套设计：一个**外置于执行代理的、关于开发者"判断力"的分身**——一个*自学习、可复用、有强干预力*的

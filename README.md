@@ -1,19 +1,52 @@
-# The Self-Learning Code Double
+# CodeDouble — your double, watching your AI
 
-An **external monitor that sits beside your AI coding session and acts on your behalf — toward
-the AI, never prompting you.** It carries your intent as a maintained memory (the **spine**):
-per-session anchors (goal / constraints / decisions / todos / avoid), distilled per-project and
-globally. Every turn it **injects** that intent to steer the AI, **detects drift** away from it,
-and **sends bad changes back** to be redone — so the AI stays *like you* even when you're absent.
-You only ever talk to the AI; the double never interrupts you. It learns from what you actually
-do — no labelling.
+**Your AI coding agent drifts.** It forgets the goal mid-session, re-litigates decisions you
+already made, and confidently does the exact thing you rejected an hour ago. Telling it again
+doesn't stick — and babysitting it defeats the point.
+
+**CodeDouble is an external monitor that sits beside the session and acts on your behalf —
+toward the AI, never interrupting you.** It carries your intent as a maintained memory and
+holds the AI to it, so the agent stays *like you* even when you step away.
+
+## What it does
+
+- 🎯 **Carries your intent, every turn.** Goal, constraints, decisions, todos, and rejected
+  approaches are maintained per session (Mem0-style incremental memory — edited in place, never
+  re-derived, never wiped) and injected into the AI's context each turn to steer it.
+- ↩️ **Sends bad changes back — with the receipt.** In enforce mode, a change that contradicts
+  something you established is denied *before it lands*, and the AI is told exactly which anchor
+  it violated, verbatim, plus how to redo it. You only ever talk to the AI; the double argues
+  with it for you.
+- 🧭 **Catches drift.** Actions that stray from the session's goal or touch your avoid-list are
+  redirected on the spot — including approaches you rejected in *other* sessions of the project.
+- ✅ **Todos clear themselves.** Completed actions stream back into the memory as evidence, so
+  finished work drops off the list and stale intent doesn't accumulate.
+- 🪞 **Learns you without labelling.** It watches what you actually do — accept, edit, revert,
+  correct — across sessions, projects, and one global tier. Session goals stay private to their
+  session; only habits that recur across projects graduate to global.
+- 📏 **Measures itself.** A send-back you route around is auto-labelled a false positive (no
+  labelling work), and the gates ship with a frozen calibration suite reporting FP/FN rates —
+  so "does it actually help?" is a number, not a vibe.
+- 🖥️ **VS Code panel.** This session's goal, its full anchors, and every send-back — what the
+  AI tried → why it was rejected — paired to the session running in your window's folder.
+
+## Get started — one command
+
+```bash
+./setup.sh            # wires the AI-harness hooks (enforce + QC), installs the package,
+                      # pulls the local model, builds the VS Code panel. Idempotent.
+./setup.sh --shadow   # observe-only mode: see what it WOULD do, block nothing
+```
+
+Smart dispatch keeps it cheap: a local model (qwen2.5-coder) handles the frequent per-edit
+checks as a rough filter; the remote judge (GLM) is consulted only where the verdict matters —
+confirming a send-back before it fires. Plain allows never leave your machine.
 
 **Two modules, one product:**
 
-1. **The memory spine (built — the core).** Session-keyed anchors maintained *incrementally*
-   (Mem0-style add/update/delete/noop, never re-derived), graduating to per-project and global
-   distills; gateway hooks inject + gate against them (drift, quality). This is what makes the
-   double *be you*: explicit intent, enforced.
+1. **The memory spine (built — the core).** Session-keyed anchors maintained incrementally,
+   graduating to per-project and global distills; gateway hooks inject + gate against them
+   (drift, quality). This is what makes the double *be you*: explicit intent, enforced.
 2. **The taste module (later — the add-on).** Learning code-style and edit *precedent* from
    passive reactions (override / revert / accept), signature-matched. In scope, deliberately
    deferred: intent > inferred taste, and the spine must be solid first.
@@ -23,7 +56,7 @@ do — no labelling.
 > But the gate before everything is empirical: **prove the loop works on a real human first.**
 > The marketplace is what that unlocks, not what we build first.
 
-This document is the living design record. Open questions are marked **[OPEN]**.
+The rest of this page is the living design record. Open questions are marked **[OPEN]**.
 
 ---
 
@@ -40,7 +73,12 @@ This document is the living design record. Open questions are marked **[OPEN]**.
   their own project's distill + global, never a foreign goal.
 - **Steering + gating** — each turn the anchors are injected to steer the AI; enforce mode gates
   actions: **known-bad precedent → send back with the pinpoint fix; drift from the session's own
-  anchors → deny + redirect; quality check vs established intent → redo.** Never blocks the
+  anchors → deny + redirect; quality check → redo.** QC judges **consistency, not sufficiency**:
+  it denies only when a change *contradicts one nameable anchor* (cited verbatim in the send-back —
+  no nameable violation ⇒ allow; an atomic/mechanical step is never "insufficient"). Judging is
+  **cascaded**: comment-only edits pass deterministically; the local model is the rough filter;
+  the remote judge confirms only where the verdict matters — every would-be send-back, and allows
+  that lexically brush an anchor. Plain allows never pay a remote call. Never blocks the
   never-seen; never prompts the developer.
 - **Smart dispatch** — frequent per-edit checks → local model first (qwen2.5-coder); hard
   session-wide work → remote (GLM); heuristic fallback. Empirical model floor: incremental anchor
@@ -51,12 +89,19 @@ This document is the living design record. Open questions are marked **[OPEN]**.
 - **The numbers that now gate the spine** — *anchor fidelity* (do the injected anchors match what
   you'd say your goal/constraints are?) and *send-back precision* (send-backs you endorse vs
   fight). These replace §8's override-rate, which measured the deferred taste module.
+  Send-back precision **measures itself**: a denied change that lands anyway via another path is
+  auto-labelled a fought send-back (no user labelling). The gates are also **calibrated against a
+  frozen fixture suite** (`tests/calibration.py`, 22 cases mutated from real failures + an
+  adversarial set) reporting FP/FN per gate — local-7B-only baseline: QC FP 12% / FN 19%, drift
+  FP 17% / FN 0%; every miss was judge capability (the remote judge got all of them right), which
+  is what motivated the cascade.
 - **Outcome loop** — completed actions (PostToolUse) stream into per-session outcomes; the
   maintainer digests them as `[outcomes]` *evidence* (never intent), so finished todos self-clear
   and unevidenced ones are kept (verified selective on live runs).
-- **Known limits (open, honest)** — QC/drift gate only Edit/Write (Bash bypasses) and QC
-  over-blocks mechanical edits (send-back precision is measurably imperfect); privacy/redaction
-  of stored diffs still open; anchor fidelity has no automated measure yet.
+- **Known limits (open, honest)** — QC/drift gate only Edit/Write (Bash bypasses — measured via
+  the fought-send-back labels, but not yet closed); a *paraphrased* violation sharing no
+  vocabulary with its anchor can slip the local filter without triggering remote confirmation;
+  privacy/redaction of stored diffs still open; anchor fidelity has no automated measure yet.
 
 ---
 
