@@ -198,11 +198,12 @@ function readPanel(): Panel {
       const c = String(r.cwd || "");
       return !c ? false : (!folders.length || folders.some((f) => c === f || c.startsWith(f + "/")));
     };
-    const local = recs.filter(here);
+    const acts = recs.filter((r) => r.verdict !== "bypassed");   // meta-records: not actions
+    const local = acts.filter(here);
     // only fall back to the global log when NO record carries a cwd yet (old data);
     // if this folder simply has no session, show nothing rather than leak another's.
-    const anyCwd = recs.some((r) => !!r.cwd);
-    const pool = (folders.length && anyCwd) ? local : recs;
+    const anyCwd = acts.some((r) => !!r.cwd);
+    const pool = (folders.length && anyCwd) ? local : acts;
     // "this session" = the most recent session in this window's folder
     let sid = "";
     for (let i = pool.length - 1; i >= 0; i--) {

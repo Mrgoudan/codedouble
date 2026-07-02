@@ -384,6 +384,44 @@ class TestAnchorGraduation(unittest.TestCase):
         self.cli._session_outcome(self.log, "sO", "Edit", "  ")
         self.assertEqual(sum(1 for _ in open(p)), 2)
 
+    def test_qc_denies_only_on_nameable_violation(self):
+        # contradiction-based QC: no cited anchor -> allow; cited -> deny with citation
+        import codedouble.backends as B
+        orig = B.llm_complete
+        try:
+            B.llm_complete = lambda *a, **k: '{"violates": null}'
+            ok, v, r = self.cli._quality_check({"goal": "g"}, "import hashlib")
+            self.assertTrue(ok)
+            B.llm_complete = lambda *a, **k: ('{"violates": "Session ID is the key, not project", '
+                                              '"refine": "key by session id"}')
+            ok, v, r = self.cli._quality_check({"goal": "g"}, "use project id as the key")
+            self.assertFalse(ok)
+            self.assertIn("Session ID", v)
+            # judge crashes / garbage -> fail-open
+            B.llm_complete = lambda *a, **k: "not json"
+            self.assertTrue(self.cli._quality_check({"goal": "g"}, "x")[0])
+        finally:
+            B.llm_complete = orig
+
+    def test_bypassed_sendback_is_flagged(self):
+        import json, time
+        p = os.path.join(self.d, "decisions.jsonl")
+        deny = {"ts": time.time(), "event": "PreToolUse", "tool": "Edit", "verdict": "deny",
+                "session_id": "sB", "target": "README.md",
+                "before": "scope note this section gates the taste module precedent confidence deferred"}
+        open(p, "w").write(json.dumps(deny) + "\n")
+        # same content lands via Bash -> flagged once, not twice
+        ran = "python3 - <<PY ... scope note this section gates the taste module precedent confidence deferred ... PY"
+        self.cli._flag_bypassed_sendback(self.log, "sB", "Bash", "python3 - <<PY README.md", ran)
+        self.cli._flag_bypassed_sendback(self.log, "sB", "Bash", "python3 - <<PY README.md", ran)
+        rows = [json.loads(l) for l in open(p) if l.strip()]
+        self.assertEqual(sum(1 for r in rows if r.get("verdict") == "bypassed"), 1)
+        self.assertEqual([r for r in rows if r.get("verdict") == "bypassed"][0]["ref"], deny["ts"])
+        # an unrelated completed action does not flag
+        self.cli._flag_bypassed_sendback(self.log, "sB", "Bash", "ls", "ls -la /tmp totally unrelated listing")
+        rows = [json.loads(l) for l in open(p) if l.strip()]
+        self.assertEqual(sum(1 for r in rows if r.get("verdict") == "bypassed"), 1)
+
     def test_norm_anchors_coerces(self):
         out = self.cli._norm_anchors({"goal": 5, "constraints": "notalist", "todos": [" x ", "", 7]},
                                      fallback={"constraints": ["fb"]})

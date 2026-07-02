@@ -232,11 +232,15 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", be
 
 
 _QC_SYSTEM = (
-    "You are a strict reviewer of an AI's proposed code change. Given the developer's "
-    "intent and the proposed change, decide if it adequately and correctly fulfills the "
-    "intent. Return ONLY JSON: {\"ok\": true} if it is good enough, or "
-    "{\"ok\": false, \"refine\": \"<one concise, specific instruction telling the AI how to "
-    "redo it better>\"} if it is not."
+    "You are a guardrail watching an AI coding session. Given the session's ANCHORS "
+    "(goal / constraints / decisions / todos / avoid) and ONE proposed change, decide "
+    "whether the change CONTRADICTS a specific anchor. Judge CONSISTENCY, not "
+    "sufficiency: an atomic, partial, or mechanical step that simply doesn't advance "
+    "the goal is FINE — most steps of a large task look insufficient alone. Flag ONLY "
+    "a clear violation of one nameable anchor. Return ONLY JSON: "
+    "{\"violates\": \"<the exact anchor text violated>\", \"refine\": \"<one concise "
+    "instruction for redoing it>\"} if it clearly contradicts one, else "
+    "{\"violates\": null}."
 )
 
 
@@ -259,17 +263,23 @@ def _last_prompt(log_path):
     return last
 
 
-def _quality_check(intent, proposed):
-    """Ask the LOCAL model whether the change meets the intent. Returns
-    (ok, refine). Fail-open: any error -> ok=True (never block on QC failure)."""
+def _quality_check(anchors, proposed):
+    """Does this change CONTRADICT a specific session anchor? Returns
+    (ok, violated_anchor, refine). Deny requires a NAMEABLE violation — if the judge
+    can't cite the anchor, the change passes (consistency, not sufficiency: judging
+    atomic steps against the whole goal was the dominant false-positive mode).
+    Fail-open: any error -> ok=True (never block on QC failure)."""
     try:
         from .backends import llm_complete                       # frequent / per-edit -> local first
-        out = llm_complete(f"Intent:\n{intent}\n\nProposed change:\n{proposed[:2000]}",
+        out = llm_complete(json.dumps({"anchors": anchors, "proposed_change": proposed[:2000]}),
                            system=_QC_SYSTEM, json_mode=True, timeout=40, prefer="local")
         data = json.loads(out)
-        return bool(data.get("ok", True)), str(data.get("refine", ""))[:600]
+        violated = str(data.get("violates") or "").strip()
+        if not violated or violated.lower() in ("null", "none"):
+            return True, "", ""
+        return False, violated[:300], str(data.get("refine", ""))[:600]
     except Exception:
-        return True, ""
+        return True, "", ""
 
 
 def _maybe_reflect(log_path, summarize=False):
@@ -451,6 +461,45 @@ def _session_outcome(log_path, sid, tool, target):
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
+
+
+def _flag_bypassed_sendback(log_path, sid, tool, target, ran, window_s=1800):
+    """FALSE-POSITIVE labeller for send-back precision: when a change the double DENIED
+    subsequently lands anyway via another path (e.g. an Edit deny re-applied via Bash),
+    the send-back demonstrably didn't change the outcome — count it as fought/bypassed.
+    Deterministic (target match or strong content overlap), log-only, self-labelling:
+    no user labelling needed. Appends a verdict="bypassed" meta-record referencing the
+    deny's ts; metrics/panel can then compute precision = 1 - bypassed/denied."""
+    if not sid or not (ran or "").strip():
+        return
+    try:
+        p = os.path.join(os.path.dirname(log_path) or ".", "decisions.jsonl")
+        rows = [json.loads(l) for l in open(p).readlines()[-200:] if l.strip()]
+    except Exception:
+        return
+    now = time.time()
+    flagged = {r.get("ref") for r in rows if r.get("verdict") == "bypassed"}
+    rsig = _anchor_sig(str(ran)[:2000])
+    for r in reversed(rows):
+        if r.get("verdict") != "deny" or r.get("session_id") != sid:
+            continue
+        if r.get("ts", 0) < now - window_s or r.get("ts") in flagged:
+            continue
+        dsig = _anchor_sig(r.get("before", ""))
+        same_target = bool(r.get("target")) and (r["target"] in str(target) or str(target) in r["target"])
+        overlap = bool(dsig) and len(rsig & dsig) >= max(4, int(0.6 * len(dsig)))
+        if (same_target and overlap) or (overlap and len(dsig) >= 8):
+            try:
+                with open(p, "a") as f:
+                    f.write(json.dumps({
+                        "ts": now, "event": "PostToolUse", "tool": tool, "verdict": "bypassed",
+                        "session_id": sid, "target": str(target)[:160], "ref": r.get("ts"),
+                        "reason": ("[codedouble] a change denied earlier landed anyway via "
+                                   f"{tool} — that send-back is counted as a false positive"),
+                    }) + "\n")
+            except Exception:
+                pass
+            return                       # flag at most one deny per completed action
 
 
 def _session_note(log_path, sid, prompt, cwd=None):
@@ -1059,20 +1108,21 @@ def cmd_hook(args):
                     after = dredirect or "Re-align with the session goal."
                     reason = (f"[codedouble] (on the developer's behalf) this drifts from the "
                               f"session goal — {dreason}. Instead: {after}")
-            # Optional quality gate (opt-in, Edit/Write only): if the proposed change
-            # doesn't meet the intent, reject + paraphrase + send it back to redo.
+            # Optional quality gate (opt-in, Edit/Write only): deny ONLY when the change
+            # CONTRADICTS a nameable session anchor (consistency, not sufficiency —
+            # judging atomic steps against the whole goal was pure false positives).
+            # No consolidated anchors yet -> nothing to contradict -> allow.
             if (enforce and verdict == "allow" and tool in ("Edit", "Write")
                     and os.environ.get("CODEDOUBLE_QC") == "1"):
                 proposed = str(ti.get("new_string") or ti.get("content") or "")
-                if proposed.strip():
-                    # check against the SESSION SUMMARY (established intent), not just the last prompt
-                    intent_ref = (_session_summary(args.log, ev.get("session_id", ""))
-                                  or _last_prompt(args.log) or payload["request"])
-                    ok, refine = _quality_check(intent_ref, proposed)
+                anchors_struct = _session_anchors_struct(args.log, ev.get("session_id", ""))
+                if proposed.strip() and anchors_struct.get("goal"):
+                    ok, violated, refine = _quality_check(anchors_struct, proposed)
                     if not ok:
                         verdict = "deny"
-                        after = refine or "Redo it to match what was asked, more carefully."
-                        reason = f"[codedouble] quality check — this doesn't fully meet the intent. {after}"
+                        after = refine or "Redo it without violating that anchor."
+                        reason = (f"[codedouble] quality check — this contradicts an established "
+                                  f"anchor: \"{violated}\". {after}")
             _log_decision(args.log, name, tool, dec, enforce, intent=payload["request"],
                           verdict=verdict, before=before, after=after, target=target,
                           session_id=ev.get("session_id", ""), reason=reason, cwd=cwd)
@@ -1093,6 +1143,7 @@ def cmd_hook(args):
             ran = str(ti.get("new_string") or ti.get("content") or ti.get("command") or "")
             _capture_reply(args.log, tool, target, ran)
             _session_outcome(args.log, ev.get("session_id", ""), tool, target)  # outcome loop
+            _flag_bypassed_sendback(args.log, ev.get("session_id", ""), tool, target, ran)
             return
     except Exception:
         return  # fail-open: never block the user's session
