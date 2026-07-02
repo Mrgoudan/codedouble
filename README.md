@@ -1,24 +1,67 @@
 # The Self-Learning Code Double
 
-A design for an **external double of a developer's judgment** — a *self-learning, reusable,
-forceful* agent that learns **when you'd want to be asked versus when to just act**, from what you
-actually do, and carries that judgment across every tool and repo you own.
+An **external monitor that sits beside your AI coding session and acts on your behalf — toward
+the AI, never prompting you.** It carries your intent as a maintained memory (the **spine**):
+per-session anchors (goal / constraints / decisions / todos / avoid), distilled per-project and
+globally. Every turn it **injects** that intent to steer the AI, **detects drift** away from it,
+and **sends bad changes back** to be redone — so the AI stays *like you* even when you're absent.
+You only ever talk to the AI; the double never interrupts you. It learns from what you actually
+do — no labelling.
 
-> **The future is a market for doubles.** A double is trained on your behavior and lives *outside*
-> any one tool — so it is an asset **you own**, portable across executors, repos, and time. The
-> endgame: doubles are **sold** — a top engineer's coding judgment, packaged, bought, and plugged
-> into anyone's agent.
->
-> **But you must prove it works first.** A marketplace is worthless if the underlying loop doesn't
-> actually learn. The gate before everything else is a single empirical number that *nobody has*:
-> **does a real human's override-rate fall as the double learns their way?** Earn that number
-> first. The marketplace is what it *unlocks* — not what we build first.
+**Two modules, one product:**
 
-This document is the design discussion, not a finished spec. Open questions are marked **[OPEN]**.
+1. **The memory spine (built — the core).** Session-keyed anchors maintained *incrementally*
+   (Mem0-style add/update/delete/noop, never re-derived), graduating to per-project and global
+   distills; gateway hooks inject + gate against them (drift, quality). This is what makes the
+   double *be you*: explicit intent, enforced.
+2. **The taste module (later — the add-on).** Learning code-style and edit *precedent* from
+   passive reactions (override / revert / accept), signature-matched. In scope, deliberately
+   deferred: intent > inferred taste, and the spine must be solid first.
+
+> **Endgame vision — a market for doubles.** A double trained on your behavior lives *outside*
+> any one tool: an asset you own, portable across executors, repos, and time — eventually sold.
+> But the gate before everything is empirical: **prove the loop works on a real human first.**
+> The marketplace is what that unlocks, not what we build first.
+
+This document is the living design record. Open questions are marked **[OPEN]**.
 
 ---
 
-## TL;DR — the whole design in one screen
+## The spine, in one screen — what is built and live
+
+- **Capture** — editor reactions + git + chat corrections → `~/.codedouble/interactions.jsonl`;
+  gateway hooks (`UserPromptSubmit` / `PreToolUse` / `PostToolUse`) wired into the AI harness.
+- **Session anchors** (key = **session id** — same project, different goals per conversation):
+  goal / constraints / decisions / todos / avoid in `sessions/<sid>.anchors.json`, maintained
+  **incrementally** (Mem0-style ADD/UPDATE/DELETE/NOOP over only the new notes; never re-derived,
+  never wiped on LLM failure; injected IDE/system blocks stripped — *a goal is never a selection*).
+- **Distills** — session anchors graduate (goal-free) to a per-project bucket (repo root of `cwd`)
+  and rules recurring across ≥2 projects to one global distill; fresh sessions are primed from
+  their own project's distill + global, never a foreign goal.
+- **Steering + gating** — each turn the anchors are injected to steer the AI; enforce mode gates
+  actions: **known-bad precedent → send back with the pinpoint fix; drift from the session's own
+  anchors → deny + redirect; quality check vs established intent → redo.** Never blocks the
+  never-seen; never prompts the developer.
+- **Smart dispatch** — frequent per-edit checks → local model first (qwen2.5-coder); hard
+  session-wide work → remote (GLM); heuristic fallback. Empirical model floor: incremental anchor
+  ops are local-safe; consolidation needs the remote tier; LLM prune tested and **rejected**
+  (unreliable both tiers).
+- **Panel (VS Code)** — this session's goal + full anchors + send-backs (what the AI tried → why
+  it was rejected), paired to the AI session running in the window's folder.
+- **The numbers that now gate the spine** — *anchor fidelity* (do the injected anchors match what
+  you'd say your goal/constraints are?) and *send-back precision* (send-backs you endorse vs
+  fight). These replace §8's override-rate, which measured the deferred taste module.
+- **Known limits (open, honest)** — no outcome loop yet (the maintainer sees prompts, not results,
+  so todos don't self-clear); QC/drift gate only Edit/Write (Bash bypasses) and QC over-blocks
+  mechanical edits; privacy/redaction of stored diffs still open.
+
+---
+
+## Original design map — one screen (§0–§12)
+
+*The sections below are the original design record, kept intact. The ask/act–preference and
+signature/§8 leg (§1, §3, §5–§9) describes the **taste module — in scope, built later**; the
+spine above is the product today.*
 
 - **§0 What a double is** — an external *self-learning · reusable · forceful* double of your
   judgment; must clear two bars: no agent can do it **and** it's a real pain.
@@ -518,6 +561,11 @@ experienced user.
 ---
 
 ## 8. The proof gate — the one number that must come first
+
+*Scope note (2026-07): this §8 number gates the **taste module** (precedent/confidence), which is
+deferred. The **spine** is gated by different numbers — **anchor fidelity** and **send-back
+precision** (see "The spine, in one screen"). Kept here unchanged as the taste module's gate for
+when it's built.*
 
 > **Of the times the index said "high confidence, stay silent," how often did the user
 > override/revert — and is that rate falling over time?**
