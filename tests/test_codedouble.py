@@ -370,6 +370,20 @@ class TestAnchorGraduation(unittest.TestCase):
         _, ok3 = self.cli._update_anchors({"goal": "g"}, ["<ide_opened_file> opened x.py"])
         self.assertTrue(ok3)                           # only IDE-noise -> nothing to process (NOOP)
 
+    def test_outcome_loop_records_and_feeds(self):
+        # PostToolUse outcomes are recorded per session (consecutive dupes skipped)...
+        self.cli._session_outcome(self.log, "sO", "Edit", "cli.py")
+        self.cli._session_outcome(self.log, "sO", "Edit", "cli.py")     # dup -> skipped
+        self.cli._session_outcome(self.log, "sO", "Bash", "git commit -m x")
+        p = self.cli._sid_file(self.log, "sO", ".outcomes.jsonl")
+        self.assertEqual(sum(1 for _ in open(p)), 2)
+        # ...and an [outcomes] line is evidence, never a goal
+        self.assertEqual(self.cli._heuristic_goal(["[outcomes] Edit cli.py; Bash git commit"]), "")
+        # no sid / no target -> no write
+        self.cli._session_outcome(self.log, "", "Edit", "x")
+        self.cli._session_outcome(self.log, "sO", "Edit", "  ")
+        self.assertEqual(sum(1 for _ in open(p)), 2)
+
     def test_norm_anchors_coerces(self):
         out = self.cli._norm_anchors({"goal": 5, "constraints": "notalist", "todos": [" x ", "", 7]},
                                      fallback={"constraints": ["fb"]})

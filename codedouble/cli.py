@@ -430,6 +430,29 @@ def _sid_file(log_path, sid, ext):
     return os.path.join(_session_dir(log_path), f"{(sid or 'default')[:64]}{ext}")
 
 
+def _session_outcome(log_path, sid, tool, target):
+    """Append a completed action to this session's OUTCOMES stream — the evidence the
+    anchor maintainer uses to clear done todos / confirm decisions (the maintainer
+    otherwise sees only prompts, so todos would never self-clear). Compact: tool +
+    target only, consecutive duplicates skipped."""
+    if not sid or not (target or "").strip():
+        return
+    try:
+        p = _sid_file(log_path, sid, ".outcomes.jsonl")
+        rec = {"ts": time.time(), "tool": tool, "target": str(target).strip()[:120]}
+        try:
+            with open(p) as f:
+                last = json.loads(f.readlines()[-1])
+            if last.get("tool") == rec["tool"] and last.get("target") == rec["target"]:
+                return                       # consecutive duplicate (retry/loop) -> skip
+        except Exception:
+            pass
+        with open(p, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def _session_note(log_path, sid, prompt, cwd=None):
     """Incrementally append the user's intent (and the cwd / project it came from)
     to this session's running notes — the cwd is what scopes graduation/seeding."""
@@ -464,6 +487,8 @@ def _heuristic_goal(notes):
     the session goal still shows when the LLM is unavailable (rate-limited/offline)."""
     for n in notes:
         t = _clean_prompt(n)                           # drop injected IDE/system noise
+        if t[:1] == "[":
+            continue                                   # [outcomes]/bracketed evidence, not intent
         if len(t) >= 12:
             t = re.split(r"(?<=[.!?])\s", t)[0]       # first sentence
             t = re.split(r"\s+at\s+[~/]", t)[0]        # drop "... at /a/path"
@@ -484,7 +509,11 @@ _UPDATE_SYSTEM = (
     "DELETE an item a message supersedes, contradicts, completes, or resolves; keep the "
     "goal unchanged unless a message clearly changes the overall goal. If the new messages "
     "change nothing (acknowledgement, question, chit-chat), return the CURRENT anchors "
-    "unchanged. Each item one short line, grounded in the messages; never invent content."
+    "unchanged. A message starting with [outcomes] lists actions that were actually "
+    "completed — it is EVIDENCE, never new intent: DELETE a todo only when an outcome "
+    "explicitly shows that exact task finished; KEEP every todo the outcomes do not "
+    "cover, and never remove constraints/decisions because of outcomes alone. Each "
+    "item one short line, grounded in the messages; never invent content."
 )
 
 
@@ -880,11 +909,22 @@ def cmd_summarize(args):
         except Exception:
             cur = {}
         processed = int(cur.get("_n") or 0)
-        new = notes[processed:]
-        if not new:
-            continue                      # no new notes -> skip (exact count, no mtime race)
+        new = list(notes[processed:])
+        # outcome loop: what actually got DONE since the last update (clears todos)
+        try:
+            outs = [json.loads(l) for l in open(notes_path[:-6] + ".outcomes.jsonl") if l.strip()]
+        except Exception:
+            outs = []
+        processed_o = int(cur.get("_o") or 0)
+        new_out = outs[processed_o:]
+        if not new and not new_out:
+            continue                      # nothing new -> skip (exact counts, no mtime race)
+        if new_out:
+            new.append("[outcomes] actions completed since the last update: " + "; ".join(
+                f"{o.get('tool', '?')} {o.get('target', '')}" for o in new_out[-30:]))
         updated, ok = _update_anchors(cur, new)
         updated["_n"] = len(notes) if ok else processed   # advance only when the LLM ran
+        updated["_o"] = len(outs) if ok else processed_o
         sid = os.path.basename(notes_path)[:-6]
         try:
             with open(apath, "w") as f:
@@ -1052,6 +1092,7 @@ def cmd_hook(args):
             target = str(ti.get("file_path") or ti.get("command") or "")
             ran = str(ti.get("new_string") or ti.get("content") or ti.get("command") or "")
             _capture_reply(args.log, tool, target, ran)
+            _session_outcome(args.log, ev.get("session_id", ""), tool, target)  # outcome loop
             return
     except Exception:
         return  # fail-open: never block the user's session
