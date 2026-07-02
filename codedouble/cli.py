@@ -263,23 +263,63 @@ def _last_prompt(log_path):
     return last
 
 
+_COMMENT_LINE_RE = re.compile(r"^\s*(#|//|/\*|\*/|\*|<!--|--\s)")
+
+
+def _comment_only(text):
+    """A change consisting solely of comments cannot violate a behavioral anchor —
+    allow it without any judge (kills the mention-vs-use false-positive class at
+    the source, deterministically)."""
+    lines = [l for l in str(text).splitlines() if l.strip()]
+    return bool(lines) and all(_COMMENT_LINE_RE.match(l) for l in lines)
+
+
+def _suspicious(anchors, proposed):
+    """Cheap lexical trigger for a remote second opinion: the change shares >=2
+    distinctive tokens with a single constraint/decision/avoid item. Only a trigger
+    (costs one remote call), never a verdict."""
+    psig = _anchor_sig(str(proposed)[:2000])
+    for key in ("constraints", "decisions", "avoid"):
+        for item in (anchors.get(key) or []):
+            if len(psig & _anchor_sig(item)) >= 2:
+                return True
+    return False
+
+
 def _quality_check(anchors, proposed):
     """Does this change CONTRADICT a specific session anchor? Returns
-    (ok, violated_anchor, refine). Deny requires a NAMEABLE violation — if the judge
-    can't cite the anchor, the change passes (consistency, not sufficiency: judging
-    atomic steps against the whole goal was the dominant false-positive mode).
-    Fail-open: any error -> ok=True (never block on QC failure)."""
-    try:
-        from .backends import llm_complete                       # frequent / per-edit -> local first
+    (ok, violated_anchor, refine). Deny requires a NAMEABLE violation — consistency,
+    not sufficiency. CASCADED judging (calibrated 2026-07: local-7B FP 12% / FN 19%,
+    remote judge got every miss right): comment-only -> allow deterministically;
+    the LOCAL model is the rough filter; the REMOTE judge confirms only when the
+    verdict is about to matter — a local DENY (before we gate the AI) or a local
+    allow on a lexically anchor-adjacent change. Plain allows never pay a remote
+    call. Fail-open at every step (never block on judge failure)."""
+    if _comment_only(proposed):
+        return True, "", ""
+
+    def _judge(prefer):
+        from .backends import llm_complete
         out = llm_complete(json.dumps({"anchors": anchors, "proposed_change": proposed[:2000]}),
-                           system=_QC_SYSTEM, json_mode=True, timeout=40, prefer="local")
+                           system=_QC_SYSTEM, json_mode=True, timeout=45, prefer=prefer)
         data = json.loads(out)
         violated = str(data.get("violates") or "").strip()
         if not violated or violated.lower() in ("null", "none"):
             return True, "", ""
         return False, violated[:300], str(data.get("refine", ""))[:600]
+
+    try:
+        ok, violated, refine = _judge("local")
     except Exception:
         return True, "", ""
+    try:
+        if not ok:
+            return _judge("remote")            # confirm every send-back; overturn local FPs
+        if _suspicious(anchors, proposed):
+            return _judge("remote")            # second opinion on anchor-adjacent allows
+    except Exception:
+        pass                                   # remote unreachable -> keep the local verdict
+    return ok, violated, refine
 
 
 def _maybe_reflect(log_path, summarize=False):
@@ -887,7 +927,8 @@ _DRIFT_SYSTEM = (
     "action the AI is about to take, decide if the action DRIFTS: it works toward "
     "something other than the goal, breaks a constraint, contradicts a decision, or does "
     "something on the avoid list. Be conservative \u2014 setup/exploration that plausibly "
-    "serves the goal is NOT drift. Return ONLY JSON: "
+    "serves the goal is NOT drift, and MENTIONING, documenting, or discussing an avoided "
+    "approach is NOT drift; only actually DOING it is. Return ONLY JSON: "
     '{"drift": true|false, "reason": "<one line>", "redirect": "<what to do instead>"}.'
 )
 
@@ -919,6 +960,14 @@ def _drift_check(anchors, request, diff=""):
         d = json.loads(llm_complete(prompt, system=_DRIFT_SYSTEM, json_mode=True,
                                     timeout=30, prefer="local"))
         if isinstance(d, dict) and d.get("drift"):
+            try:                                   # local judge is noisy -> remote confirms
+                d2 = json.loads(llm_complete(prompt, system=_DRIFT_SYSTEM, json_mode=True,
+                                             timeout=45, prefer="remote"))
+                if isinstance(d2, dict) and not d2.get("drift"):
+                    return (False, "", "")         # overturned: don't send the AI back
+                d = d2 if isinstance(d2, dict) and d2.get("drift") else d
+            except Exception:
+                pass
             return (True, str(d.get("reason", ""))[:400], str(d.get("redirect", ""))[:400])
     except Exception:
         pass

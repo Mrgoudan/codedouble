@@ -384,6 +384,50 @@ class TestAnchorGraduation(unittest.TestCase):
         self.cli._session_outcome(self.log, "sO", "Edit", "  ")
         self.assertEqual(sum(1 for _ in open(p)), 2)
 
+    def test_qc_cascade_routing(self):
+        # local = rough filter; remote confirms only denies and suspicious allows
+        import codedouble.backends as B
+        A = {"goal": "g", "constraints": ["Session ID is the key for separation"],
+             "decisions": [], "avoid": []}
+        orig = B.llm_complete
+        calls = []
+        def fake(responses):
+            def f(prompt, system=None, json_mode=False, timeout=0, prefer="local"):
+                calls.append(prefer)
+                return responses[prefer]
+            return f
+        try:
+            # comment-only -> allow, NO judge at all
+            B.llm_complete = fake({})           # any call would KeyError
+            calls.clear()
+            self.assertTrue(self.cli._quality_check(A, "# just a comment\n// another")[0])
+            self.assertEqual(calls, [])
+            # local deny + remote allow -> overturned (false positive killed)
+            B.llm_complete = fake({"local": '{"violates": "Session ID is the key for separation"}',
+                                   "remote": '{"violates": null}'})
+            calls.clear()
+            self.assertTrue(self.cli._quality_check(A, "x = 1")[0])
+            self.assertEqual(calls, ["local", "remote"])
+            # local deny + remote deny -> deny with remote citation
+            B.llm_complete = fake({"local": '{"violates": "local cite"}',
+                                   "remote": '{"violates": "remote cite", "refine": "fix"}'})
+            ok, v, _ = self.cli._quality_check(A, "x = 1")
+            self.assertFalse(ok); self.assertEqual(v, "remote cite")
+            # plain allow, NOT anchor-adjacent -> no remote call
+            B.llm_complete = fake({"local": '{"violates": null}'})
+            calls.clear()
+            self.assertTrue(self.cli._quality_check(A, "import hashlib")[0])
+            self.assertEqual(calls, ["local"])
+            # local allow but anchor-adjacent (shares "session"+"separation") -> remote catches it
+            B.llm_complete = fake({"local": '{"violates": null}',
+                                   "remote": '{"violates": "Session ID is the key for separation"}'})
+            calls.clear()
+            ok, v, _ = self.cli._quality_check(A, "simplify session separation by keying off cwd")
+            self.assertEqual(calls, ["local", "remote"])
+            self.assertFalse(ok)
+        finally:
+            B.llm_complete = orig
+
     def test_qc_denies_only_on_nameable_violation(self):
         # contradiction-based QC: no cited anchor -> allow; cited -> deny with citation
         import codedouble.backends as B
