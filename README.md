@@ -51,9 +51,12 @@ This document is the living design record. Open questions are marked **[OPEN]**.
 - **The numbers that now gate the spine** — *anchor fidelity* (do the injected anchors match what
   you'd say your goal/constraints are?) and *send-back precision* (send-backs you endorse vs
   fight). These replace §8's override-rate, which measured the deferred taste module.
-- **Known limits (open, honest)** — no outcome loop yet (the maintainer sees prompts, not results,
-  so todos don't self-clear); QC/drift gate only Edit/Write (Bash bypasses) and QC over-blocks
-  mechanical edits; privacy/redaction of stored diffs still open.
+- **Outcome loop** — completed actions (PostToolUse) stream into per-session outcomes; the
+  maintainer digests them as `[outcomes]` *evidence* (never intent), so finished todos self-clear
+  and unevidenced ones are kept (verified selective on live runs).
+- **Known limits (open, honest)** — QC/drift gate only Edit/Write (Bash bypasses) and QC
+  over-blocks mechanical edits (send-back precision is measurably imperfect); privacy/redaction
+  of stored diffs still open; anchor fidelity has no automated measure yet.
 
 ---
 
