@@ -267,16 +267,57 @@ class TestAnchorGraduation(unittest.TestCase):
         self.cli._session_note(self.log, "sNone", "hello")
         self.assertEqual(self.cli._session_anchors(self.log, "sNone"), "")
 
-    def test_own_anchors_take_precedence_over_seed(self):
-        # once a session has consolidated its OWN anchors, they win verbatim (incl. goal)
+    def test_decision_anchors_combine_tiers(self):
+        # the decision view = session ⊕ project distill ⊕ global distill, deduped;
+        # goal ONLY from the session tier; cross-session rules present automatically
+        import tempfile
+        proj = tempfile.mkdtemp()
+        self.cli._merge_project_distill(self.log, {"constraints": ["never use relative paths in scripts"]},
+                                        self.cli._scope_key(proj))
+        with open(self.cli._global_distill_path(self.log), "w") as f:
+            f.write(self.json.dumps({"avoid": ["speculation without real runs"]}))
+        self.cli._session_note(self.log, "sM", "work on the tool", proj)
+        with open(self.cli._sid_file(self.log, "sM", ".anchors.json"), "w") as f:
+            f.write(self.json.dumps({"goal": "my own goal", "constraints": ["session-local rule"]}))
+        m = self.cli._decision_anchors(self.log, "sM")
+        self.assertEqual(m["goal"], "my own goal")
+        self.assertIn("session-local rule", m["constraints"])          # session tier
+        self.assertIn("never use relative paths in scripts", m["constraints"])  # project tier
+        self.assertIn("speculation without real runs", m["avoid"])     # global tier
+        # a session with NO own anchors is primed by the tiers but gets NO goal
+        self.cli._session_note(self.log, "sM2", "another conversation", proj)
+        m2 = self.cli._decision_anchors(self.log, "sM2")
+        self.assertEqual(m2["goal"], "")
+        self.assertIn("never use relative paths in scripts", m2["constraints"])
+
+    def test_gate_fires_on_project_distill_rule(self):
+        # the point of the combine: a rule learned in OTHER sessions of this project
+        # gates THIS session's action even though its own anchors lack it
+        import tempfile
+        proj = tempfile.mkdtemp()
+        self.cli._merge_project_distill(
+            self.log, {"avoid": ["Using project ID alone as the key for separation"]},
+            self.cli._scope_key(proj))
+        self.cli._session_note(self.log, "sD2", "keep building", proj)
+        with open(self.cli._sid_file(self.log, "sD2", ".anchors.json"), "w") as f:
+            f.write(self.json.dumps({"goal": "build the tool"}))       # own anchors: goal only
+        m = self.cli._decision_anchors(self.log, "sD2")
+        self.assertTrue(self.cli._drift_check(
+            m, "refactor to use the project id alone as the key", "")[0])
+
+    def test_own_goal_wins_but_distill_rules_still_apply(self):
+        # decision-time combine: the session's OWN goal always wins (a distill never
+        # carries one), but distilled rules now MERGE IN rather than being shadowed
+        # by the session's own anchors — cross-session learning applies every turn
         self.cli._merge_project_distill(self.log, {"goal": "global g", "constraints": ["global c"]})
         ap = self.cli._sid_file(self.log, "s_own", ".anchors.json")
         with open(ap, "w") as f:
             f.write(self.json.dumps({"goal": "my own goal", "constraints": ["my own constraint"]}))
         out = self.cli._session_anchors(self.log, "s_own")
         self.assertIn("my own goal", out)
-        self.assertIn("my own constraint", out)
-        self.assertNotIn("global c", out)
+        self.assertNotIn("global g", out)            # a distill goal never surfaces
+        self.assertIn("my own constraint", out)      # session tier present
+        self.assertIn("global c", out)               # distilled rule now applies too
 
     def test_global_distill_promotes_cross_project_rules(self):
         # a habit that RECURS across projects globalizes; a project-specific rule does not

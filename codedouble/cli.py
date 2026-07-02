@@ -873,40 +873,41 @@ def _session_scope(log_path, sid):
     return _scope_key(cwd)
 
 
-def _seed_from_scope(log_path, scope, per_key=8):
-    """PRIME a fresh session from the DISTILL tiers: this PROJECT's distill plus the
-    GLOBAL distill (constraints/avoid), deduped. NEVER a goal — a goal is session-only
-    (the session grows its own from its own prompts), so no foreign goal can leak in.
-    Project-specific decisions seed too; another project's items never do."""
+def _decision_anchors(log_path, sid):
+    """The ONE anchor view every decision consumes — injection, drift, and QC alike:
+    this session's OWN anchors (the goal comes ONLY from here) combined with the
+    project distill and the global distill, deduped, session items first. This is
+    what makes cross-session learning BITE at the moment of action, automatically —
+    the user never manually curates memory to get good behavior. A fresh session is
+    thereby primed from its project's rules; a distill never contributes a goal
+    (a prior session's goal is not this session's task)."""
+    own = _session_anchors_struct(log_path, sid)
+
     def _load(p):
         try:
             return json.loads(open(p).read()) if os.path.exists(p) else {}
         except Exception:
             return {}
+
+    scope = _session_scope(log_path, sid)
     proj = _load(_scope_anchors_path(log_path, scope))
     glob = _load(_global_distill_path(log_path))
-    out = {}
-    for key in ("constraints", "avoid"):
-        merged = _dedupe_anchors(list(proj.get(key) or []) + list(glob.get(key) or []))
-        if merged:
-            out[key] = merged[:per_key]
-    if proj.get("decisions"):
-        out["decisions"] = (proj.get("decisions") or [])[:per_key]
-    return _render_anchors(out) if out else ""
+    out = {"goal": str(own.get("goal") or ""), "todos": list(own.get("todos") or [])}
+    for key, tiers in (("constraints", (own, proj, glob)),
+                       ("decisions", (own, proj)),
+                       ("avoid", (own, proj, glob))):
+        items = []
+        for t in tiers:
+            items.extend(t.get(key) or [])
+        out[key] = _dedupe_anchors(items)[:12]
+    return out
 
 
 def _session_anchors(log_path, sid):
-    """Anchors (rendered) for steering. The session's OWN anchors if consolidated
-    (verbatim, incl. its goal); else SEED the domain-relevant slice of the durable
-    global anchors so a fresh session starts primed (over-time→local), not blank —
-    and never inherits another project's anchors."""
-    try:
-        ap = _sid_file(log_path, sid, ".anchors.json")
-        if os.path.exists(ap):
-            return _render_anchors(json.loads(open(ap).read()))
-    except Exception:
-        pass
-    return _seed_from_scope(log_path, _session_scope(log_path, sid))
+    """Anchors (rendered) for steering — the merged decision view (session ⊕ project
+    distill ⊕ global distill). A session with no own anchors gets its project's
+    rules and no goal; one with anchors gets both, deduped."""
+    return _render_anchors(_decision_anchors(log_path, sid))
 
 
 def _session_anchors_struct(log_path, sid):
@@ -1149,7 +1150,7 @@ def cmd_hook(args):
             # established goal / constraints / decisions / avoid? Acts on the developer's
             # behalf TOWARD the AI — sends it back to re-align, never prompts the developer.
             if enforce and verdict == "allow" and os.environ.get("CODEDOUBLE_DRIFT") == "1":
-                anchors = _session_anchors_struct(args.log, ev.get("session_id", ""))
+                anchors = _decision_anchors(args.log, ev.get("session_id", ""))
                 is_drift, dreason, dredirect = _drift_check(
                     anchors, payload["request"], payload.get("diff", ""))
                 if is_drift:
@@ -1164,7 +1165,7 @@ def cmd_hook(args):
             if (enforce and verdict == "allow" and tool in ("Edit", "Write")
                     and os.environ.get("CODEDOUBLE_QC") == "1"):
                 proposed = str(ti.get("new_string") or ti.get("content") or "")
-                anchors_struct = _session_anchors_struct(args.log, ev.get("session_id", ""))
+                anchors_struct = _decision_anchors(args.log, ev.get("session_id", ""))
                 if proposed.strip() and anchors_struct.get("goal"):
                     ok, violated, refine = _quality_check(anchors_struct, proposed)
                     if not ok:
