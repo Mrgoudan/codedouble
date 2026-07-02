@@ -242,8 +242,8 @@ function readPanel(): Panel {
       if (r.verdict === "deny" && (r.before || r.after || r.reason)) {
         sentBack.push({
           intent: shortIntent(String(r.target || r.intent || r.tool || "")),
-          before: shortIntent(String(r.before || ""), 140),
-          why: shortIntent(String(r.reason || r.after || "redo"), 220),
+          before: shortIntent(String(r.before || ""), 300),
+          why: shortIntent(String(r.reason || r.after || "redo"), 2000),  // the WHY is the point — show it whole
           rel: relTime(Number(r.ts) || 0),
         });
       }

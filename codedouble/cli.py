@@ -211,9 +211,9 @@ def _log_decision(log_path, event, tool, dec, enforce, intent="", verdict="", be
                 "target": (target or "").strip()[:160],   # file / command (for reply correlation)
                 "intent": (intent or "").strip()[:140],
                 "resolution": (dec.resolution or "").strip()[:140],
-                "before": (before or "").strip()[:200],   # what the AI proposed
-                "after": (after or "").strip()[:200],      # the correction the double asked for
-                "reason": (reason or "").strip()[:240],    # codedouble's reply / WHY it was sent back
+                "before": (before or "").strip()[:400],   # what the AI proposed
+                "after": (after or "").strip()[:600],      # the correction the double asked for
+                "reason": (reason or "").strip()[:1200],   # the WHY — the product's voice; generous cap
                 "verdict": verdict,            # inject | allow | ask | deny | answered | shadow | watch
                 "action": dec.action.value, "ask": dec.action.value == "ask",
                 "confidence": round(dec.confidence, 3), "coverage": round(dec.coverage, 3),
@@ -267,7 +267,7 @@ def _quality_check(intent, proposed):
         out = llm_complete(f"Intent:\n{intent}\n\nProposed change:\n{proposed[:2000]}",
                            system=_QC_SYSTEM, json_mode=True, timeout=40, prefer="local")
         data = json.loads(out)
-        return bool(data.get("ok", True)), str(data.get("refine", ""))[:200]
+        return bool(data.get("ok", True)), str(data.get("refine", ""))[:600]
     except Exception:
         return True, ""
 
@@ -870,7 +870,7 @@ def _drift_check(anchors, request, diff=""):
         d = json.loads(llm_complete(prompt, system=_DRIFT_SYSTEM, json_mode=True,
                                     timeout=30, prefer="local"))
         if isinstance(d, dict) and d.get("drift"):
-            return (True, str(d.get("reason", ""))[:200], str(d.get("redirect", ""))[:200])
+            return (True, str(d.get("reason", ""))[:400], str(d.get("redirect", ""))[:400])
     except Exception:
         pass
     return (False, "", "")
