@@ -1,58 +1,38 @@
-# CodeDouble Capture — VS Code extension
+# CodeDouble — your double, watching your AI
 
-The editor-level capture surface for the Self-Learning Code Double. It records
-the signals a git hook can't see — **accept / override / reject / viewed** —
-into the **same** `.codedouble/interactions.jsonl` the Python CLI analyzes.
-Capture happens in the editor; analysis + visualization stay in Python
-(`python3 -m codedouble.cli report`). Two-phase by design (README §6).
+This panel is the visible face of **[CodeDouble](https://gitee.com/ziruichen12138/codedouble)** —
+an external monitor that sits beside your AI coding session and acts on your behalf, toward the
+AI, without ever prompting you.
 
-## What it captures
+## What the panel shows
 
-**Automatically (heuristic):**
-- A single large insert (≥ `minInsertLines` lines or ≥ `minInsertChars` chars) =
-  a **proposal** (AI output or paste).
-- If that region is edited within `overrideWindowMs` → **override** (records the
-  before/after).
-- If it survives `settleMs` unedited → **accepted_silent** *only if it was on
-  screen*; if never on screen → **never_viewed** (zero signal, README §6).
+- **This session's goal and anchors** — the intent (goal / constraints / decisions / todos /
+  avoid-list) the monitor maintains from your conversation and injects to steer the AI each turn.
+- **Send-backs, with the receipt** — every change the monitor rejected: what the AI tried → which
+  of your anchors it violated, verbatim, and how it was told to redo it.
+- **Counts** — sent back vs let through, for the AI session running in this window's folder.
 
-**Explicitly (commands / bind keys to these):**
-- `CodeDouble: Accept selection (reviewed, wholesale)` → **confirmed_good** (the strong positive)
-- `CodeDouble: Mark selection as an override` → **override** (prompts for the original X)
-- `CodeDouble: Reject / interrupt` → **interrupt**
-- `CodeDouble: Open report` → runs `python3 -m codedouble.cli report`
-- `CodeDouble: Toggle capture on/off`
+It also captures editor reactions (accept / override / reject) passively — no labelling — as
+learning signal for the monitor.
 
-A status-bar item (`$(eye) CodeDouble N`) shows the session count; click it for the report.
+## Requires the CodeDouble gateway
 
-## Build & run
+The extension alone is the dashboard. The monitor itself (gateway hooks + memory + gates) is a
+small Python package wired into your AI harness:
 
 ```bash
-cd editor/vscode-codedouble
-npm install
-npm run compile           # -> out/extension.js
-```
-Then in VS Code: open this folder and press **F5** (launches an Extension
-Development Host with the extension loaded). Or package and install:
-```bash
-npx @vscode/vsce package  # -> vscode-codedouble-0.1.0.vsix
-code --install-extension vscode-codedouble-0.1.0.vsix
+git clone https://gitee.com/ziruichen12138/codedouble.git && cd codedouble && ./setup.sh
 ```
 
-Open your project, code as usual, then `python3 -m codedouble.cli report`.
+`setup.sh` is idempotent: installs the package, pulls the local model (optional), wires the
+hooks, and builds this panel. Use `./setup.sh --shadow` for observe-only mode.
 
-## Settings
+## Tips
 
-`codedouble.enabled`, `minInsertLines` (3), `minInsertChars` (80),
-`overrideWindowMs` (120000), `settleMs` (90000).
+- The panel lives in its own Activity Bar icon (the eye). On profiles with very many extensions,
+  VS Code can race view registration and drop it into Explorer — drag the "This session" view
+  onto the Activity Bar once to pin it permanently.
+- The panel is read-only by design: the monitor learns from what you do, never from manual
+  memory curation.
 
-## Honest limits
-
-This is heuristic capture — it infers "the AI proposed this" from *large
-inserts*, not from any specific agent's API. That conflates AI output with large
-pastes (acceptable: both are "code that appeared, kept or changed"), and range
-tracking ignores line drift. For precise per-suggestion accept/reject you'd
-integrate with your AI agent's own API and call the same JSONL writer. The
-explicit commands give clean, unambiguous labels in the meantime — and the
-strong `confirmed_good` signal only comes from an explicit reviewed-accept,
-exactly as the design intends.
+MIT licensed. Issues and design record: [gitee.com/ziruichen12138/codedouble](https://gitee.com/ziruichen12138/codedouble).

@@ -32,7 +32,7 @@ fi
 if command -v code >/dev/null 2>&1 && [ -d "$HERE/editor/vscode-codedouble" ]; then
   ( cd "$HERE/editor/vscode-codedouble" \
       && npm run compile >/dev/null 2>&1 \
-      && npx --yes @vscode/vsce package --allow-missing-repository --skip-license >/dev/null 2>&1 \
+      && npx --yes @vscode/vsce package >/dev/null 2>&1 \
       && code --install-extension vscode-codedouble-*.vsix >/dev/null 2>&1 ) \
     && echo "[3/4] VS Code capture panel installed" \
     || echo "[3/4] VS Code panel skipped (build/install failed)"

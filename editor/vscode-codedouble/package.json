@@ -1,14 +1,15 @@
 {
   "name": "vscode-codedouble",
-  "displayName": "CodeDouble Capture",
-  "description": "Faithfully records editor interactions (accept / override / reject / viewed) into .codedouble/interactions.jsonl for the Self-Learning Code Double, with a live panel.",
-  "version": "0.1.22",
+  "displayName": "CodeDouble",
+  "description": "Your double, watching your AI: shows this session's goal and anchors, and every change it sent back — what the AI tried and why it was rejected. Panel for the CodeDouble external monitor.",
+  "version": "0.1.23",
   "publisher": "codedouble",
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": [
-    "Other"
+    "AI",
+    "Visualization"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -101,5 +102,21 @@
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.75.0",
     "typescript": "^5.4.0"
-  }
+  },
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://gitee.com/ziruichen12138/codedouble.git"
+  },
+  "homepage": "https://gitee.com/ziruichen12138/codedouble",
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "guardrails",
+    "monitor",
+    "claude",
+    "code-review"
+  ]
 }
