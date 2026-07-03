@@ -38,6 +38,11 @@ holds the AI to it, so the agent stays *like you* even when you step away.
 ./setup.sh --shadow   # observe-only mode: see what it WOULD do, block nothing
 ```
 
+> **Icon not on the Activity Bar?** On profiles with many extensions, VS Code can race view
+> registration and drop the panel into Explorer (it does the same to Copilot and Python on such
+> setups). One-time fix: drag the **"This session"** view from Explorer onto the Activity Bar —
+> that pins it permanently. The panel is fully functional from Explorer either way.
+
 Smart dispatch keeps it cheap: a local model (qwen2.5-coder) handles the frequent per-edit
 checks as a rough filter; the remote judge (GLM) is consulted only where the verdict matters —
 confirming a send-back before it fires. Plain allows never leave your machine.
