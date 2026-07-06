@@ -28,14 +28,36 @@ else
   echo "[2/4] ollama not found — skipping local tier (remote LLM port still works)"
 fi
 
-# 3) VS Code capture panel (optional)
+# 3) VS Code panel (optional) — self-verifying: a bad build can't silently install
 if command -v code >/dev/null 2>&1 && [ -d "$HERE/editor/vscode-codedouble" ]; then
-  ( cd "$HERE/editor/vscode-codedouble" \
+  EXTDIR="$HERE/editor/vscode-codedouble"
+  VER=$(python3 -c "import json;print(json.load(open('$EXTDIR/package.json'))['version'])")
+  VSIX="$EXTDIR/vscode-codedouble-$VER.vsix"
+  ( cd "$EXTDIR" \
+      && rm -f vscode-codedouble-*.vsix \
       && npm run compile >/dev/null 2>&1 \
-      && npx --yes @vscode/vsce package >/dev/null 2>&1 \
-      && code --install-extension vscode-codedouble-*.vsix >/dev/null 2>&1 ) \
-    && echo "[3/4] VS Code capture panel installed" \
-    || echo "[3/4] VS Code panel skipped (build/install failed)"
+      && npx --yes @vscode/vsce package >/dev/null 2>&1 ) || VSIX=""
+  # verify the EXACT vsix before installing: activity-bar container + icons inside
+  if [ -n "$VSIX" ] && [ -f "$VSIX" ] && python3 - "$VSIX" <<'PYV' >/dev/null 2>&1
+import json, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); names = z.namelist()
+m = json.loads(z.read("extension/package.json"))
+assert m["contributes"]["viewsContainers"]["activitybar"], "no activity-bar container"
+cid = m["contributes"]["viewsContainers"]["activitybar"][0]["id"]
+assert m["contributes"]["views"].get(cid), "views not under the container"
+assert "extension/media/eye.svg" in names and "extension/media/icon.png" in names, "icons missing"
+PYV
+  then
+    code --install-extension "$VSIX" --force >/dev/null 2>&1 \
+      && echo "[3/4] VS Code panel v$VER installed (verified: activity-bar container + icons)" \
+      || echo "[3/4] VS Code panel: install FAILED (code --install-extension)"
+    if pgrep -x code >/dev/null 2>&1; then
+      echo "      NOTE: VS Code is running — fully QUIT it (File -> Exit) and reopen."
+      echo "      'Developer: Reload Window' is NOT enough to load a new extension version."
+    fi
+  else
+    echo "[3/4] VS Code panel skipped (build failed or vsix failed verification)"
+  fi
 else
   echo "[3/4] 'code' not found — skipping VS Code panel"
 fi

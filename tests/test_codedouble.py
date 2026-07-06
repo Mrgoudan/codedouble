@@ -514,5 +514,39 @@ class TestAnchorGraduation(unittest.TestCase):
         self.assertEqual(out["constraints"], ["fb"])   # non-list -> fallback
         self.assertEqual(out["todos"], ["x", "7"])     # trimmed/stringified, empties dropped
 
+
+class TestExtensionManifest(unittest.TestCase):
+    """Locks the VS Code packaging invariants that caused weeks of 'the icon
+    never shows up': the activity-bar container must exist, views must live
+    under it, and the icon must be alpha-mask-renderable."""
+    EXT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "editor", "vscode-codedouble")
+
+    def test_manifest_contributes_activity_bar(self):
+        import json
+        d = json.load(open(os.path.join(self.EXT, "package.json")))
+        bars = d["contributes"]["viewsContainers"]["activitybar"]
+        self.assertEqual(len(bars), 1)
+        cid = bars[0]["id"]
+        self.assertEqual(cid, "codedoubleSidebar")     # reused id owns a visible slot; changing it orphans users' layout state
+        self.assertIn(cid, d["contributes"]["views"])  # views must live under the container
+        ids = [v["id"] for v in d["contributes"]["views"][cid]]
+        self.assertIn("cdCaptureView", ids)            # the provider registers this id
+        icon = bars[0]["icon"]
+        self.assertTrue(os.path.exists(os.path.join(self.EXT, icon)))
+        self.assertTrue(os.path.exists(os.path.join(self.EXT, d["icon"])))  # marketplace png
+
+    def test_activity_icon_is_maskable(self):
+        # VS Code alpha-masks activity-bar SVGs: relative (em/%) sizing renders BLANK
+        # (an invisible icon in a visible slot — the original weeks-long bug)
+        svg = open(os.path.join(self.EXT, "media", "eye.svg")).read()
+        self.assertIn("viewBox", svg)
+        self.assertNotRegex(svg, r'(width|height)="[^"]*(em|%)')
+        self.assertNotIn("<style", svg)                # masked SVGs must not rely on CSS
+
+    def test_vscodeignore_ships_media(self):
+        ig = open(os.path.join(self.EXT, ".vscodeignore")).read()
+        self.assertNotIn("media", ig)                  # excluding media/ ships a blank container
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
