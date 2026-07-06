@@ -267,6 +267,28 @@ class TestAnchorGraduation(unittest.TestCase):
         self.cli._session_note(self.log, "sNone", "hello")
         self.assertEqual(self.cli._session_anchors(self.log, "sNone"), "")
 
+    def test_scope_enabled_controls_folders(self):
+        import tempfile, subprocess
+        proj = tempfile.mkdtemp(); other = tempfile.mkdtemp()
+        # default: on everywhere
+        self.assertTrue(self.cli._scope_enabled(self.log, proj))
+        # central off-list: repo root + anything under it
+        with open(self.cli._scope_config_path(self.log), "w") as f:
+            f.write(self.json.dumps({"off": [proj]}))
+        self.assertFalse(self.cli._scope_enabled(self.log, proj))
+        sub = os.path.join(proj, "src", "deep"); os.makedirs(sub)
+        self.assertFalse(self.cli._scope_enabled(self.log, sub))
+        self.assertTrue(self.cli._scope_enabled(self.log, other))   # unrelated folder unaffected
+        # prefix must be path-safe: /a/b off must NOT disable /a/b-sibling
+        sib = proj + "-sibling"; os.makedirs(sib, exist_ok=True)
+        self.assertTrue(self.cli._scope_enabled(self.log, sib))
+        # repo-local marker file
+        os.makedirs(os.path.join(other, ".git"), exist_ok=True)
+        open(os.path.join(other, ".codedouble.off"), "w").write("")
+        self.assertFalse(self.cli._scope_enabled(self.log, other))
+        # no cwd / fail-open -> on
+        self.assertTrue(self.cli._scope_enabled(self.log, ""))
+
     def test_decision_anchors_combine_tiers(self):
         # the decision view = session ⊕ project distill ⊕ global distill, deduped;
         # goal ONLY from the session tier; cross-session rules present automatically

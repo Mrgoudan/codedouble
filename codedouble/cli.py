@@ -686,6 +686,65 @@ def _scope_key(cwd):
     return (base[:80] + "-" + h) if base else "default"
 
 
+def _scope_config_path(log_path):
+    return os.path.join(os.path.dirname(log_path) or ".", "scope.json")
+
+
+def _scope_enabled(log_path, cwd):
+    """Is this folder subject to the double at all? Control is per PROJECT (repo
+    root), two ways: a central off-list (`codedouble scope off` — one command, no
+    repo litter) or a `.codedouble.off` marker committed in the repo (travels with
+    the checkout). Off means TOTAL invisibility: no capture, no notes, no
+    injection, no gating. Default: on. Fail-open: any error -> on."""
+    try:
+        root = _repo_root(cwd) if cwd else ""
+        if not root:
+            return True                      # no project context -> default on
+        if os.path.exists(os.path.join(root, ".codedouble.off")):
+            return False
+        cfg = json.loads(open(_scope_config_path(log_path)).read())
+        for off in cfg.get("off") or []:
+            off = str(off).rstrip("/")
+            if root == off or root.startswith(off + "/"):
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def cmd_scope(args):
+    """`codedouble scope off|on|status [--path P]` — control which folders the
+    double governs. off/on operate on the repo root of P (default: cwd)."""
+    root = _repo_root(os.path.abspath(args.path or os.getcwd()))
+    p = _scope_config_path(args.log)
+    try:
+        cfg = json.loads(open(p).read())
+    except Exception:
+        cfg = {}
+    off = [str(x).rstrip("/") for x in (cfg.get("off") or [])]
+    if args.action == "off":
+        if root not in off:
+            off.append(root)
+        cfg["off"] = off
+        with open(p, "w") as f:
+            f.write(json.dumps(cfg, indent=2))
+        print(f"codedouble is now OFF for {root}")
+    elif args.action == "on":
+        cfg["off"] = [x for x in off if not (root == x or root.startswith(x + "/"))]
+        with open(p, "w") as f:
+            f.write(json.dumps(cfg, indent=2))
+        marker = os.path.join(root, ".codedouble.off")
+        note = " (note: .codedouble.off marker present — remove it too)" if os.path.exists(marker) else ""
+        print(f"codedouble is now ON for {root}{note}")
+    else:
+        state = "ON" if _scope_enabled(args.log, root) else "OFF"
+        print(f"{state}  {root}")
+        if off:
+            print("off-list:")
+            for x in off:
+                print(f"  - {x}")
+
+
 def _scope_anchors_path(log_path, scope):
     """Per-project durable-anchor file: <store>/anchors/<scope>.json."""
     d = os.path.join(os.path.dirname(log_path) or ".", "anchors")
@@ -1084,6 +1143,8 @@ def cmd_hook(args):
         name = ev.get("hook_event_name", "")
         enforce = os.environ.get("CODEDOUBLE_ENFORCE") == "1"
         cwd = ev.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or ""    # project scope (both paths)
+        if not _scope_enabled(args.log, cwd):
+            return                            # folder opted out -> the double is invisible here
 
         if name == "UserPromptSubmit":
             prompt = ev.get("prompt", "")
@@ -1347,6 +1408,10 @@ def main(argv=None):
     p.add_argument("--conf", type=float, default=0.6)
     p.add_argument("--shadow", action="store_true", help="never block; just log/emit the decision")
     p.set_defaults(func=cmd_gate)
+
+    p = sub.add_parser("scope", help="control which folders the double governs (off|on|status)")
+    p.add_argument("action", choices=["off", "on", "status"])
+    p.add_argument("--path", default=None); p.set_defaults(func=cmd_scope)
 
     p = sub.add_parser("hook", help="Claude Code hook adapter (reads hook JSON on stdin)")
     p.add_argument("--conf", type=float, default=0.6); p.set_defaults(func=cmd_hook)

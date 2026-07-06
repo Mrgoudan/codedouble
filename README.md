@@ -36,6 +36,9 @@ holds the AI to it, so the agent stays *like you* even when you step away.
 ./setup.sh            # wires the AI-harness hooks (enforce + QC), installs the package,
                       # pulls the local model, builds the VS Code panel. Idempotent.
 ./setup.sh --shadow   # observe-only mode: see what it WOULD do, block nothing
+
+codedouble scope off  # run in any folder: the double goes fully dark there —
+codedouble scope on   # no capture, no memory, no gating. One command back on.
 ```
 
 > **Icon not on the Activity Bar?** On profiles with many extensions, VS Code can race view
@@ -103,10 +106,14 @@ The rest of this page is the living design record. Open questions are marked **[
 - **Outcome loop** — completed actions (PostToolUse) stream into per-session outcomes; the
   maintainer digests them as `[outcomes]` *evidence* (never intent), so finished todos self-clear
   and unevidenced ones are kept (verified selective on live runs).
+- **Per-folder control** — `codedouble scope off|on|status`: opt any repo out entirely (no
+  capture, no notes, no injection, no gating — verified nothing is written while off), via a
+  central off-list or a `.codedouble.off` marker committed in the repo. Default: on.
 - **Known limits (open, honest)** — QC/drift gate only Edit/Write (Bash bypasses — measured via
   the fought-send-back labels, but not yet closed); a *paraphrased* violation sharing no
   vocabulary with its anchor can slip the local filter without triggering remote confirmation;
-  privacy/redaction of stored diffs still open; anchor fidelity has no automated measure yet.
+  redaction of secrets in stored diffs still open (per-repo opt-out now exists); anchor
+  fidelity has no automated measure yet.
 
 ---
 
