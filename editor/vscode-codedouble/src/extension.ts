@@ -46,6 +46,43 @@ function cfg<T>(key: string, dflt: T): T {
 
 // GLOBAL, machine-wide store by default (matches the Python CLI default,
 // ~/.codedouble). Override with CODEDOUBLE_LOG (file) or CODEDOUBLE_HOME (dir).
+function repoRoot(start: string): string {
+  let cur = path.resolve(start);
+  for (;;) {
+    if (fs.existsSync(path.join(cur, ".git"))) return cur;
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(start);
+    cur = parent;
+  }
+}
+
+function scopeState(): { root: string; off: boolean; byMarker: boolean } {
+  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!ws) return { root: "", off: false, byMarker: false };
+  const root = repoRoot(ws);
+  if (fs.existsSync(path.join(root, ".codedouble.off"))) return { root, off: true, byMarker: true };
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(path.dirname(logPath()), "scope.json"), "utf8"));
+    for (const o of (cfg.off || [])) {
+      const p = String(o).replace(/\/+$/, "");
+      if (root === p || root.startsWith(p + "/")) return { root, off: true, byMarker: false };
+    }
+  } catch { /* no config -> on */ }
+  return { root, off: false, byMarker: false };
+}
+
+function scopeToggle(): void {
+  const st = scopeState();
+  if (!st.root || st.byMarker) return;          // marker-controlled: managed in the repo, not here
+  const p = path.join(path.dirname(logPath()), "scope.json");
+  let cfg: { off?: string[] } = {};
+  try { cfg = JSON.parse(fs.readFileSync(p, "utf8")); } catch { /* fresh */ }
+  const off = (cfg.off || []).map((x) => String(x).replace(/\/+$/, ""));
+  cfg.off = st.off ? off.filter((x) => !(st.root === x || st.root.startsWith(x + "/")))
+                   : off.concat([st.root]);
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+}
+
 function logPath(): string {
   const envLog = process.env.CODEDOUBLE_LOG;
   if (envLog) {
@@ -114,6 +151,21 @@ function flash(doc: vscode.TextDocument, startLine: number, endLine: number): vo
   setTimeout(() => ed.setDecorations(flashDeco, []), 1400);
 }
 
+function scopedOff(doc: vscode.TextDocument): boolean {
+  // "off" must mean fully dark: the editor-capture path honors scope like the hooks do
+  const ws = vscode.workspace.getWorkspaceFolder(doc.uri)?.uri.fsPath;
+  if (!ws) return false;
+  const root = repoRoot(ws);
+  if (fs.existsSync(path.join(root, ".codedouble.off"))) return true;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(path.dirname(logPath()), "scope.json"), "utf8"));
+    return (cfg.off || []).some((o: string) => {
+      const p = String(o).replace(/\/+$/, "");
+      return root === p || root.startsWith(p + "/");
+    });
+  } catch { return false; }
+}
+
 function record(
   doc: vscode.TextDocument, outcome: string, resolution: string,
   correctedFrom: string | null, diff: string, actionKind = "edit",
@@ -121,6 +173,7 @@ function record(
 ): void {
   const lp = logPath();
   if (!lp) return;
+  if (scopedOff(doc)) return;                    // folder opted out -> capture nothing
   const rel = vscode.workspace.asRelativePath(doc.uri);
   const wsf = vscode.workspace.getWorkspaceFolder(doc.uri);
   const repo = wsf ? wsf.uri.fsPath : "";
@@ -346,6 +399,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
     v.webview.onDidReceiveMessage((m) => {
       if (m?.cmd === "openReport") vscode.commands.executeCommand("codedouble.openReport");
       if (m?.cmd === "toggle") vscode.commands.executeCommand("codedouble.toggle");
+      if (m?.cmd === "scopeToggle") { scopeToggle(); this.refresh(); }
     });
     v.onDidChangeVisibility(() => { if (v.visible) this.refresh(); });
     this.refresh();
@@ -359,6 +413,7 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       enabled: cfg<boolean>("enabled", true),
       session: sessionCount,
       store: logPath(),
+      scope: scopeState(),
       ...readPanel(),
     });
   }
@@ -396,11 +451,26 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
       .muted{opacity:.5;font-size:10px;margin-top:10px;word-break:break-all}
       .empty{opacity:.72;font-size:11px;margin-top:8px;line-height:1.55}
       .goal{margin-top:12px;padding:8px 10px;border-radius:7px;background:var(--vscode-input-background,#80808022);font-size:12px;line-height:1.4}
+      .scope{display:flex;align-items:center;gap:8px;margin-top:8px;padding:6px 10px;border-radius:7px;background:var(--vscode-input-background,#80808022)}
+      .scopepill{font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 8px;border-radius:9px;color:#fff}
+      .scopepill.on{background:#3fb950}.scopepill.off{background:#8b949e}
+      .scopefolder{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+      .scopebtn{width:auto;margin:0;padding:3px 10px;font-size:11px}
+      .dimmed{opacity:.35;pointer-events:none}
+      .offnote{margin-top:10px;font-size:11.5px;line-height:1.5;opacity:.8}
       .glbl{font-size:9px;text-transform:uppercase;letter-spacing:.06em;opacity:.55;margin-right:6px}
     </style></head><body>
       <div class="row"><span id="dot" class="dot off" title="pause / resume watching"></span>
         <b id="state">…</b><span class="grow"></span><span class="sub" id="sess"></span></div>
 
+      <div class="scope"><span id="scopepill" class="scopepill on">ON</span>
+        <span class="scopefolder" id="scopefolder"></span>
+        <button class="scopebtn" id="scopebtn">Turn off here</button></div>
+      <div id="offnote" class="offnote" style="display:none">The double is <b>off for this folder</b> —
+        nothing is captured, remembered, injected, or gated here. Everything below is history from
+        before it was turned off.</div>
+
+      <div id="content">
       <div id="goalbox" class="goal"><span class="glbl">this session’s goal</span><span id="goal"></span></div>
       <div id="anchors"></div>
 
@@ -420,6 +490,8 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
         the AI's version and the reason it was rejected show up here. <i>(Requires enforce mode.)</i>
       </div>
 
+      </div>
+
       <button id="report">Open report ▸</button>
       <div class="muted" id="foot"></div>
 
@@ -428,11 +500,22 @@ class CodeDoubleView implements vscode.WebviewViewProvider {
         const $=id=>document.getElementById(id);
         $('report').onclick=()=>vscode.postMessage({cmd:'openReport'});
         $('dot').onclick=()=>vscode.postMessage({cmd:'toggle'});
+        $('scopebtn').onclick=()=>vscode.postMessage({cmd:'scopeToggle'});
         const esc=t=>String(t==null?'':t).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
         addEventListener('message',e=>{const s=e.data;
           $('dot').className='dot '+(s.enabled?'on':'off');
           $('state').textContent=s.enabled?'watching':'paused';
           $('sess').textContent='this session';
+          const sc=s.scope||{};
+          const base=(sc.root||'').split('/').pop()||'(no folder)';
+          $('scopefolder').textContent=base;
+          $('scopepill').textContent=sc.off?'OFF':'ON';
+          $('scopepill').className='scopepill '+(sc.off?'off':'on');
+          $('scopebtn').textContent=sc.off?'Turn on here':'Turn off here';
+          $('scopebtn').style.display=(sc.root&&!sc.byMarker)?'inline-block':'none';
+          if(sc.byMarker){$('scopefolder').textContent=base+'  (.codedouble.off in repo)';}
+          $('offnote').style.display=sc.off?'block':'none';
+          $('content').className=sc.off?'dimmed':'';
           $('goal').textContent=s.goal||'';
           $('goalbox').style.display=s.goal?'block':'none';
           const sec=(title,items)=>(items&&items.length)?('<h4>'+title+'</h4><ul>'+items.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'):'';
