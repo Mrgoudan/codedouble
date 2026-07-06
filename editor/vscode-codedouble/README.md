@@ -1,6 +1,6 @@
 # CodeDouble — your double, watching your AI
 
-This panel is the visible face of **[CodeDouble](https://gitee.com/ziruichen12138/codedouble)** —
+This panel is the visible face of **[CodeDouble](https://github.com/Mrgoudan/codedouble)** —
 an external monitor that sits beside your AI coding session and acts on your behalf, toward the
 AI, without ever prompting you.
 
@@ -21,7 +21,7 @@ The extension alone is the dashboard. The monitor itself (gateway hooks + memory
 small Python package wired into your AI harness:
 
 ```bash
-git clone https://gitee.com/ziruichen12138/codedouble.git && cd codedouble && ./setup.sh
+git clone https://github.com/Mrgoudan/codedouble.git && cd codedouble && ./setup.sh
 ```
 
 `setup.sh` is idempotent: installs the package, pulls the local model (optional), wires the
@@ -35,4 +35,4 @@ hooks, and builds this panel. Use `./setup.sh --shadow` for observe-only mode.
 - The panel is read-only by design: the monitor learns from what you do, never from manual
   memory curation.
 
-MIT licensed. Issues and design record: [gitee.com/ziruichen12138/codedouble](https://gitee.com/ziruichen12138/codedouble).
+MIT licensed. Issues and design record: [github.com/Mrgoudan/codedouble](https://github.com/Mrgoudan/codedouble).

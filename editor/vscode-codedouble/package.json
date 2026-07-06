@@ -107,9 +107,9 @@
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://gitee.com/ziruichen12138/codedouble.git"
+    "url": "https://github.com/Mrgoudan/codedouble.git"
   },
-  "homepage": "https://gitee.com/ziruichen12138/codedouble",
+  "homepage": "https://github.com/Mrgoudan/codedouble",
   "keywords": [
     "ai",
     "agent",
